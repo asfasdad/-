@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>表格自动填写</title>
+  <style>
+    body { margin: 0; font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: #f4f7fb; color: #0f172a; }
+    .wrap { max-width: 900px; margin: 20px auto; padding: 0 12px; }
+    .card { background: #fff; border: 1px solid #d9e2ef; border-radius: 12px; padding: 16px; }
+    h1 { margin: 0 0 8px; font-size: 24px; }
+    .help { color: #475569; font-size: 13px; margin: 6px 0 12px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .row { margin: 8px 0; }
+    label { display: block; font-weight: 600; margin-bottom: 6px; }
+    input[type="file"], select, input[type="text"] { width: 100%; box-sizing: border-box; border: 1px solid #cfd8e7; border-radius: 8px; padding: 10px; font-size: 14px; }
+    .inline { display: flex; gap: 8px; align-items: center; }
+    .actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
+    button { border: none; border-radius: 8px; padding: 10px 12px; font-weight: 600; cursor: pointer; color: #fff; background: #334155; }
+    button.primary { background: #1d4ed8; }
+    button.green { background: #0f766e; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .status { margin-top: 10px; white-space: pre-wrap; }
+    .meta { margin-top: 8px; border: 1px dashed #cfd8e7; border-radius: 8px; padding: 10px; font-size: 13px; white-space: pre-wrap; }
+    @media (max-width: 900px) { .grid, .actions { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>沃尔玛表格自动填写</h1>
+      <div class="help">极简模式：先连接模型，再选择模型，最后上传两个表格填写下载。</div>
+
+      <form id="form">
+        <div class="grid">
+          <div class="row">
+            <label for="template_file">模板表 (.xlsx)</label>
+            <input id="template_file" type="file" accept=".xlsx" required />
+          </div>
+          <div class="row">
+            <label for="product_file">基础信息表 (.xlsx)</label>
+            <input id="product_file" type="file" accept=".xlsx" required />
+          </div>
+        </div>
+
+        <div class="row">
+          <label for="mapping_file">可选规则 JSON（不传则默认规则）</label>
+          <input id="mapping_file" type="file" accept=".json" />
+        </div>
+
+        <div class="grid">
+          <div class="row">
+            <label for="ai_model_full">模型选择（provider/model）</label>
+            <select id="ai_model_full"></select>
+          </div>
+          <div class="row inline" style="padding-top:30px;">
+            <input id="use_ai" type="checkbox" checked />
+            <label for="use_ai" style="margin:0; font-weight:500;">启用 AI 补全</label>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button type="button" id="connectModel">连接模型（命令行）</button>
+          <button type="button" id="loadModels">模型选择按钮（刷新列表）</button>
+          <button type="submit" class="primary" id="submit">填写并下载</button>
+        </div>
+
+        <div class="actions">
+          <button type="button" class="green" id="learnRules">提取默认规则</button>
+          <button type="button" id="authLogin">网页授权登录 Codex</button>
+          <button type="button" id="authStatus">检查授权状态</button>
+        </div>
+      </form>
+
+      <div id="status" class="status"></div>
+      <div id="meta" class="meta" hidden></div>
+    </div>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const metaEl = document.getElementById('meta');
+
+    function setStatus(msg, warn = false) {
+      statusEl.textContent = msg || '';
+      statusEl.style.color = warn ? '#9a3412' : '#0f172a';
+    }
+    function setMeta(lines) {
+      metaEl.hidden = false;
+      metaEl.textContent = lines.join('\n');
+    }
+    function clearMeta() {
+      metaEl.hidden = true;
+      metaEl.textContent = '';
+    }
+
+    function getSelectedModelFull() {
+      return document.getElementById('ai_model_full').value.trim();
+    }
+
+    async function loadModelList() {
+      const resp = await fetch('/opencode-models');
+      const data = await resp.json();
+      if (!data.success) throw new Error(data.error || '加载模型失败');
+      const models = Array.isArray(data.models) ? data.models : [];
+      const select = document.getElementById('ai_model_full');
+      const prev = select.value;
+      select.innerHTML = '';
+      if (models.length === 0) {
+        const opt = document.createElement('option');
+        opt.value = 'openai/gpt-4o-mini';
+        opt.textContent = 'openai/gpt-4o-mini';
+        select.appendChild(opt);
+      } else {
+        models.forEach((m) => {
+          const opt = document.createElement('option');
+          opt.value = String(m);
+          opt.textContent = String(m);
+          select.appendChild(opt);
+        });
+      }
+      if (prev && Array.from(select.options).some(o => o.value === prev)) {
+        select.value = prev;
+      }
+      return models;
+    }
+
+    function downloadBlob(blob, fileName) {
+      const a = document.createElement('a');
+      const url = URL.createObjectURL(blob);
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    document.getElementById('loadModels').addEventListener('click', async () => {
+      try {
+        setStatus('正在刷新模型列表...');
+        clearMeta();
+        const models = await loadModelList();
+        setStatus(`模型列表已刷新，共 ${models.length} 个。`);
+      } catch (err) {
+        setStatus(err instanceof Error ? err.message : '刷新失败', true);
+      }
+    });
+
+    document.getElementById('connectModel').addEventListener('click', async () => {
+      try {
+        setStatus('正在测试模型连接...');
+        clearMeta();
+        const modelFull = getSelectedModelFull();
+        const fd = new FormData();
+        fd.append('ai_model_full', modelFull);
+        const resp = await fetch('/opencode-model-connect', { method: 'POST', body: fd });
+        const data = await resp.json();
+        if (!data.success) {
+          setStatus('模型连接失败。', true);
+          setMeta([`model: ${modelFull}`, `route: ${data.route_mode || ''}`, `error: ${data.error || ''}`]);
+          return;
+        }
+        setStatus('模型连接成功。');
+        setMeta([
+          `provider: ${data.provider || ''}`,
+          `model: ${data.model || ''}`,
+          `mode: ${data.mode || 'direct'}`,
+          `route: ${data.route_mode || ''}`
+        ]);
+      } catch (err) {
+        setStatus(err instanceof Error ? err.message : '连接失败', true);
+      }
+    });
+
+    document.getElementById('form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        setStatus('正在填写，请稍候...');
+        clearMeta();
+        const tpl = document.getElementById('template_file').files[0];
+        const prod = document.getElementById('product_file').files[0];
+        const mapping = document.getElementById('mapping_file').files[0];
+        if (!tpl || !prod) throw new Error('请先上传模板表和基础信息表。');
+
+        const fd = new FormData();
+        fd.append('template_file', tpl);
+        fd.append('product_file', prod);
+        if (mapping) fd.append('mapping_file', mapping);
+        fd.append('use_ai', String(document.getElementById('use_ai').checked));
+        fd.append('ai_model_full', getSelectedModelFull());
+
+        const resp = await fetch('/autofill', { method: 'POST', body: fd });
+        if (!resp.ok) {
+          let msg = `请求失败: ${resp.status}`;
+          try {
+            const j = await resp.json();
+            if (j.detail) msg += `\n${j.detail}`;
+          } catch (_) {}
+          throw new Error(msg);
+        }
+
+        const blob = await resp.blob();
+        downloadBlob(blob, 'filled_walmart_template.xlsx');
+        const aiAdded = Number(resp.headers.get('X-AI-Added-Columns') || '0');
+        const aiWarn = resp.headers.get('X-AI-Warning') || '';
+        const useAi = document.getElementById('use_ai').checked;
+        if (useAi && (aiAdded <= 0 || aiWarn)) {
+          setStatus('文件已下载，但 AI 未有效增强本次填写（请看提示）。', true);
+        } else {
+          setStatus('填写完成，文件已下载。');
+        }
+        setMeta([
+          `映射列数: ${resp.headers.get('X-Mapped-Columns') || ''}`,
+          `AI新增映射: ${resp.headers.get('X-AI-Added-Columns') || ''}`,
+          `实际通道: ${resp.headers.get('X-AI-Effective-Provider') || ''}/${resp.headers.get('X-AI-Effective-Model') || ''} (${resp.headers.get('X-AI-Route-Mode') || ''})`,
+          `AI提示: ${resp.headers.get('X-AI-Warning') || ''}`
+        ]);
+      } catch (err) {
+        setStatus(err instanceof Error ? err.message : '填写失败', true);
+      }
+    });
+
+    document.getElementById('learnRules').addEventListener('click', async () => {
+      try {
+        setStatus('正在提取默认规则...');
+        clearMeta();
+        const prod = document.getElementById('product_file').files[0];
+        const fd = new FormData();
+        fd.append('completed_dir', '填写完成的表格');
+        fd.append('min_support', '1');
+        fd.append('save_as_default', 'true');
+        if (prod) fd.append('product_file', prod);
+        const resp = await fetch('/learn-rules-from-folder', { method: 'POST', body: fd });
+        if (!resp.ok) throw new Error(`提取失败: ${resp.status}`);
+        const blob = await resp.blob();
+        downloadBlob(blob, 'learned_mapping_rules.json');
+        setStatus('默认规则提取完成。');
+      } catch (err) {
+        setStatus(err instanceof Error ? err.message : '提取失败', true);
+      }
+    });
+
+    document.getElementById('authLogin').addEventListener('click', async () => {
+      const resp = await fetch('/opencode-auth/start', { method: 'POST' });
+      const data = await resp.json();
+      setStatus(data.success ? '已启动授权向导，请在终端完成授权。' : `启动失败: ${data.error || ''}`, !data.success);
+    });
+
+    document.getElementById('authStatus').addEventListener('click', async () => {
+      const resp = await fetch('/opencode-auth/status');
+      const data = await resp.json();
+      if (!data.success) {
+        setStatus(`状态检查失败: ${data.error || ''}`, true);
+        return;
+      }
+      setStatus(data.openai_oauth ? '已授权 OpenAI/Codex。' : '尚未授权 OpenAI/Codex。', !data.openai_oauth);
+      setMeta([`providers: ${(data.providers || []).join(', ')}`, `source: ${data.source || ''}`]);
+    });
+
+    loadModelList().catch(() => {});
+  </script>
+</body>
+</html>

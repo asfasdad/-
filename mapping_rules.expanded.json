@@ -1,0 +1,81 @@
+{
+  "mappings": [
+    {
+      "template": "price",
+      "source": "price",
+      "mode": "force",
+      "required": true,
+      "allow_ai": false
+    },
+    {
+      "template": "sku",
+      "source": "SKU",
+      "mode": "force",
+      "required": true,
+      "allow_ai": false
+    },
+    {
+      "template": "productname",
+      "source": "标题",
+      "mode": "force",
+      "required": true,
+      "allow_ai": true
+    },
+    {
+      "template": "shortdescription",
+      "source": "产品卖点",
+      "mode": "force",
+      "required": false,
+      "allow_ai": true
+    },
+    {
+      "template": "keyfeatures",
+      "source": "产品卖点",
+      "mode": "force",
+      "required": false,
+      "allow_ai": true
+    },
+    {
+      "template": "description",
+      "source": "详细参数",
+      "mode": "force",
+      "required": false,
+      "allow_ai": true
+    },
+    {
+      "template": "Product Name",
+      "source": "标题",
+      "mode": "force",
+      "required": false,
+      "allow_ai": true
+    },
+    {
+      "template": "Title",
+      "source": "标题",
+      "mode": "force",
+      "required": false,
+      "allow_ai": true
+    }
+  ],
+  "meta": {
+    "version": "2.0",
+    "created_from": "manual_expansion_based_on_product_structure",
+    "note": "Based on 沃尔玛产品信息表.xlsx structure: 标题/产品卖点/详细参数/price/SKU",
+    "critical_mappings": [
+      "price → price (required)",
+      "sku → SKU (required)",
+      "productname → 标题 (required for listing)",
+      "shortdescription/keyfeatures → 产品卖点 (selling points)"
+    ],
+    "learned_files": 7,
+    "manual_rules": 8,
+    "unresolved_template_fields": [
+      "brand - need source column for brand",
+      "mainimageurl - need source column for images",
+      "productidtype/productid - need GTIN/UPC source",
+      "shippingweight - need weight info",
+      "country of origin - need origin info",
+      "And 110+ other Walmart fields"
+    ]
+  }
+}

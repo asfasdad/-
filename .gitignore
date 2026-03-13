@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+uvicorn.log
+
+# Generated output workbooks
+filled_walmart_template*.xlsx
+最终结果*.xlsx
+默认规则结果.xlsx
+网页流程输出结果.xlsx
+
+# Local temp/debug artifacts
+headers_output.txt
+headers_extracted.json
+mapping_result.json
+template_headers.json
+result.txt
+test1.txt
+temp_script.py

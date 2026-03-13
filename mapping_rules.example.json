@@ -1,0 +1,9 @@
+{
+  "mappings": [
+    { "template": "Product Name", "source": "商品名称" },
+    { "template": "Seller SKU", "source": "SKU" },
+    { "template": "Brand", "source": "品牌" },
+    { "template": "Price", "source": "售价" },
+    { "template": "Product Description", "source": "产品描述" }
+  ]
+}
