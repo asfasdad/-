@@ -203,16 +203,19 @@
         const blob = await resp.blob();
         downloadBlob(blob, 'filled_walmart_template.xlsx');
         const aiAdded = Number(resp.headers.get('X-AI-Added-Columns') || '0');
+        const aiSynth = Number(resp.headers.get('X-AI-Synthesized-Cells') || '0');
         const aiWarn = resp.headers.get('X-AI-Warning') || '';
         const useAi = document.getElementById('use_ai').checked;
-        if (useAi && (aiAdded <= 0 || aiWarn)) {
-          setStatus('文件已下载，但 AI 未有效增强本次填写（请看提示）。', true);
+        if (useAi && (aiAdded <= 0 && aiSynth <= 0 || aiWarn)) {
+          setStatus('文件已下载，但 AI 增强较弱（请看提示）。', true);
         } else {
           setStatus('填写完成，文件已下载。');
         }
         setMeta([
           `映射列数: ${resp.headers.get('X-Mapped-Columns') || ''}`,
           `AI新增映射: ${resp.headers.get('X-AI-Added-Columns') || ''}`,
+          `AI新增单元格: ${resp.headers.get('X-AI-Synthesized-Cells') || ''}`,
+          `AI补全模式: ${resp.headers.get('X-AI-Synthesis-Mode') || ''}`,
           `实际通道: ${resp.headers.get('X-AI-Effective-Provider') || ''}/${resp.headers.get('X-AI-Effective-Model') || ''} (${resp.headers.get('X-AI-Route-Mode') || ''})`,
           `AI提示: ${resp.headers.get('X-AI-Warning') || ''}`
         ]);

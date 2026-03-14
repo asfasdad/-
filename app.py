@@ -20,6 +20,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from openpyxl.cell.cell import Cell, MergedCell
 from openpyxl import load_workbook
+from openpyxl.workbook.workbook import Workbook
+from openpyxl.utils.cell import column_index_from_string, get_column_letter, range_boundaries
 from openpyxl.worksheet.worksheet import Worksheet
 
 
@@ -31,6 +33,7 @@ CellValue = str | int | float | bool | Decimal | datetime | date | time | timede
 AI_CONFIDENCE_THRESHOLD = 0.7
 AI_SAMPLE_ROWS = 4
 AI_SAMPLE_CELL_MAX_CHARS = 160
+AI_SYNTHESIS_BATCH_ROWS = 6
 OPENCODE_RUN_TIMEOUT_SECONDS = 240
 DEFAULT_COMPLETED_DIR = "填写完成的表格"
 DEFAULT_RULES_FILE = "mapping_rules.default.json"
@@ -40,9 +43,10 @@ PROVIDER_PRESET_MODELS: dict[str, list[str]] = {
     "codex": ["gpt-5-codex", "codex-mini-latest", "gpt-4.1-mini"],
     "deepseek": ["deepseek-chat", "deepseek-reasoner"],
     "kimi": ["kimi-k2-turbo-preview", "kimi-k2", "moonshot-v1-8k"],
+    "kimi-for-coding": ["k2p5", "kimi-k2-thinking"],
 }
 
-SUPPORTED_API_PROVIDERS = {"openai", "codex", "deepseek", "kimi"}
+SUPPORTED_API_PROVIDERS = {"openai", "codex", "deepseek", "kimi", "kimi-for-coding"}
 
 
 ALIASES: dict[str, list[str]] = {
@@ -307,6 +311,8 @@ def get_ai_provider_config(
             base_url = base_url_override.strip().rstrip("/")
         if api_key_override:
             key = api_key_override.strip()
+        if not key:
+            key = get_opencode_provider_secret("openai")
         endpoint = f"{base_url}/chat/completions"
         return provider_key, key, base_url, endpoint
 
@@ -317,6 +323,8 @@ def get_ai_provider_config(
             base_url = base_url_override.strip().rstrip("/")
         if api_key_override:
             key = api_key_override.strip()
+        if not key:
+            key = get_opencode_provider_secret("openai")
         endpoint = f"{base_url}/chat/completions"
         return provider_key, key, base_url, endpoint
 
@@ -338,6 +346,18 @@ def get_ai_provider_config(
         if api_key_override:
             key = api_key_override.strip()
         endpoint = f"{base_url}/chat/completions"
+        return provider_key, key, base_url, endpoint
+
+    if provider_key == "kimi-for-coding":
+        key = os.getenv("KIMI_FOR_CODING_API_KEY", "").strip()
+        base_url = os.getenv("KIMI_FOR_CODING_BASE_URL", "https://api.kimi.com/coding/v1").rstrip("/")
+        if base_url_override:
+            base_url = base_url_override.strip().rstrip("/")
+        if api_key_override:
+            key = api_key_override.strip()
+        if not key:
+            key = get_opencode_provider_secret("kimi-for-coding")
+        endpoint = f"{base_url}/messages"
         return provider_key, key, base_url, endpoint
 
     raise HTTPException(status_code=400, detail=f"Unsupported ai_provider: {provider}")
@@ -377,6 +397,53 @@ def request_ai_completion(
     with urllib.request.urlopen(request, timeout=60) as response:
         raw_bytes = cast(bytes, response.read())
         return raw_bytes.decode("utf-8")
+
+
+def request_kimi_coding_completion(
+    *,
+    endpoint: str,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+) -> dict[str, object]:
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_prompt}],
+    }
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=90) as response:
+        raw = cast(bytes, response.read()).decode("utf-8")
+        parsed_obj = cast(object, json.loads(raw))
+        if not isinstance(parsed_obj, dict):
+            raise ValueError("Kimi coding response is not an object")
+        parsed = cast(dict[object, object], parsed_obj)
+        content_obj = parsed.get("content")
+        if isinstance(content_obj, list):
+            parts: list[str] = []
+            for item in content_obj:
+                if isinstance(item, dict):
+                    item_dict = cast(dict[object, object], item)
+                    text_obj = item_dict.get("text")
+                    if isinstance(text_obj, str):
+                        parts.append(text_obj)
+            if parts:
+                return extract_json_from_text("\n".join(parts))
+        raise ValueError("Kimi coding response missing text content")
 
 
 def extract_json_from_text(text: str) -> dict[str, object]:
@@ -450,8 +517,54 @@ def call_ai_json(
     api_key_override: str | None = None,
     base_url_override: str | None = None,
     model_full: str | None = None,
+    expected_top_keys: list[str] | None = None,
+    max_tokens: int = 900,
 ) -> dict[str, object]:
     provider_key_input = provider.strip().lower()
+    if provider_key_input == "kimi-for-coding":
+        provider_key, api_key, _base_url, endpoint = get_ai_provider_config(
+            provider,
+            api_key_override=api_key_override,
+            base_url_override=base_url_override,
+        )
+        if not api_key:
+            raise HTTPException(status_code=400, detail="API key missing for ai_provider=kimi-for-coding")
+
+        last_error = ""
+        prompts = [
+            user_prompt,
+            (
+                "Return JSON only. "
+                + (f"Required top-level keys: {expected_top_keys}. " if expected_top_keys else "")
+                + user_prompt[:7000]
+            ),
+        ]
+        for prompt in prompts:
+            try:
+                data = request_kimi_coding_completion(
+                    endpoint=endpoint,
+                    api_key=api_key,
+                    model=model,
+                    system_prompt=system_prompt,
+                    user_prompt=prompt,
+                    max_tokens=max_tokens,
+                )
+                if not expected_top_keys:
+                    return data
+                if all(key in data for key in expected_top_keys):
+                    return data
+                if data:
+                    data["fallback_reason"] = f"missing-keys:{expected_top_keys}"
+                    return data
+                last_error = f"JSON missing required keys: {expected_top_keys}"
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="ignore")
+                last_error = detail
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+
+        raise HTTPException(status_code=502, detail=f"Kimi-for-coding request failed: {last_error}")
+
     if not is_supported_api_provider(provider_key_input):
         if model_full and model_full.strip():
             return call_codex_via_opencode_json(
@@ -459,6 +572,7 @@ def call_ai_json(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 model_full=model_full,
+                expected_top_keys=expected_top_keys,
             )
         raise HTTPException(status_code=400, detail=f"Unsupported ai_provider: {provider}")
 
@@ -502,6 +616,7 @@ def call_ai_json(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model_full=model_full,
+            expected_top_keys=expected_top_keys,
         )
 
     if not api_key:
@@ -513,7 +628,7 @@ def call_ai_json(
     base_payload: dict[str, object] = {
         "model": model,
         "temperature": 0,
-        "max_tokens": 900,
+        "max_tokens": max_tokens,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -582,6 +697,7 @@ def infer_mapping_with_ai(
             api_key_override=api_key_override,
             base_url_override=base_url_override,
             model_full=model_full,
+            expected_top_keys=["mappings"],
         )
     except HTTPException as exc:
         detail_text = str(exc.detail).lower()
@@ -751,11 +867,153 @@ def split_keyfeatures(text: str, limit: int = 6) -> list[str]:
     return cleaned[:limit]
 
 
+def dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        text = item.strip()
+        if not text:
+            continue
+        key = normalize_header(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def split_sentences(text: str, limit: int = 4, max_chars_each: int = 140) -> list[str]:
+    if not text.strip():
+        return []
+    raw_parts = re.split(r"(?<=[.!?。！？])\s+|[\n;；|]+", text)
+    parts: list[str] = []
+    for p in raw_parts:
+        t = p.strip()
+        if not t:
+            continue
+        if len(t) > max_chars_each:
+            t = t[:max_chars_each].strip()
+        if t:
+            parts.append(t)
+    return dedupe_preserve_order(parts)[:limit]
+
+
+def make_short_description(text: str, max_chars: int = 300) -> str:
+    parts = split_sentences(text, limit=3, max_chars_each=180)
+    if not parts:
+        return text.strip()[:max_chars]
+    merged = " ".join(parts)
+    return merged[:max_chars].strip()
+
+
+def default_value_for_required_field(header_key: str) -> str | None:
+    key = header_key.lower().replace(" ", "")
+    if "condition" in key:
+        return "New"
+    if "skuupdate" in key or "productidupdate" in key:
+        return "No"
+    if "isprimaryvariant" in key:
+        return "No"
+    if "variantattributenames" in key:
+        return "color"
+    if "specproducttype" in key:
+        return "default"
+    if key == "unit":
+        return "default"
+    if "is" in key and "new" in key:
+        return "Yes"
+    if "certificate" in key or "accreditation" in key:
+        return "None"
+    if "prop65" in key and "warning" in key and "required" in key:
+        return "No"
+    return None
+
+
+def choose_dropdown_default_for_header(
+    header_key: str,
+    requirement_text: str,
+    options: list[str],
+) -> str | None:
+    if not options:
+        return None
+
+    key = header_key.lower().replace(" ", "")
+    rule = requirement_text.lower()
+
+    def pick(preferred: list[str]) -> str | None:
+        for item in preferred:
+            chosen = pick_best_dropdown_option(item, options)
+            if chosen:
+                return chosen
+        return None
+
+    if key in {"skuupdate", "productidupdate", "isprimaryvariant"}:
+        return pick(["No", "Yes"])
+    if key == "variantattributenames":
+        return pick(["color", "size", "pattern", "theme", "countPerPack", "count", "multipackQuantity"])
+    if "condition" in key:
+        return pick(["New", "New without box", "Open Box"])
+    if "prop65" in key and "required" in key:
+        return pick(["No", "Yes"])
+
+    if key.endswith("unit") or "_unit" in key or " unit" in rule:
+        if any(token in key for token in ["weight", "mass"]):
+            picked = pick(["lb", "oz", "kg", "g"])
+            if picked:
+                return picked
+        if any(token in key for token in ["length", "height", "width", "depth", "dimension"]):
+            picked = pick(["in", "ft", "cm", "mm", "m"])
+            if picked:
+                return picked
+        picked = pick(["in", "ft", "lb", "oz", "cm", "mm"])
+        if picked:
+            return picked
+
+    if "closed list" in rule:
+        picked = pick(["No", "None", "N/A"])
+        if picked:
+            return picked
+
+    return None
+
+
 def infer_synthesis_targets(
     template_headers: dict[int, str],
     mapping: dict[int, int],
     rule_policies: dict[str, dict[str, bool]],
 ) -> dict[int, str]:
+    blocked_tokens = {
+        "imageurl",
+        "warrantyurl",
+        "variantgroupid",
+        "zipcodes",
+        "states",
+        "staterestrictionstext",
+        "releasedate",
+        "startdate",
+        "enddate",
+        "inventoryavailabilitydate",
+        "fulfillmentcenterid",
+        "externalproductid",
+        "externalproductidtype",
+        "productid",
+        "productidtype",
+        "repricerstrategy",
+    }
+
+    def header_is_ai_generatable(compact_key: str) -> bool:
+        if not compact_key:
+            return False
+        if compact_key in blocked_tokens:
+            return False
+        if compact_key.startswith("productsecondaryimageurl"):
+            return False
+        if compact_key.startswith("swatchimageurl"):
+            return False
+        if compact_key.endswith("url"):
+            return False
+        return True
+
     targets: dict[int, str] = {}
     for col, name in template_headers.items():
         if col in mapping:
@@ -768,69 +1026,234 @@ def infer_synthesis_targets(
             continue
 
         compact = key.replace(" ", "")
-        if compact == "productname":
-            targets[col] = "productname"
-        elif compact == "shortdescription":
-            targets[col] = "shortdescription"
-        elif compact == "brand":
-            targets[col] = "brand"
-        elif compact == "price":
-            targets[col] = "price"
-        elif compact == "sku":
-            targets[col] = "sku"
-        elif compact.startswith("keyfeature"):
-            targets[col] = "keyfeatures"
+        if header_is_ai_generatable(compact):
+            targets[col] = compact
     return targets
 
 
-def ai_synthesize_row_values(
+def ai_synthesize_batch_values(
     *,
-    semantic_context: dict[str, str],
+    synthesis_targets: dict[int, str],
+    source_rows: list[dict[int, CellValue]],
+    source_headers: dict[int, str],
     provider: str,
     model: str,
     api_key_override: str,
     base_url_override: str,
     model_full: str,
-) -> dict[str, object]:
+    target_requirements: dict[int, str] | None = None,
+    target_allowed_options: dict[int, list[str]] | None = None,
+) -> tuple[dict[int, dict[int, str]], str]:
+    if not synthesis_targets or not source_rows:
+        return {}, ""
+
+    target_columns = [
+        {
+            "col": col,
+            "header": target_header,
+            "requirement": (target_requirements or {}).get(col, ""),
+            "allowed_options": (target_allowed_options or {}).get(col, [])[:20],
+        }
+        for col, target_header in sorted(synthesis_targets.items(), key=lambda x: x[0])
+    ]
+    target_cols_by_header: dict[str, list[int]] = {}
+    for col, header in synthesis_targets.items():
+        bucket = target_cols_by_header.get(header, [])
+        bucket.append(col)
+        target_cols_by_header[header] = bucket
+
+    rows_payload: list[dict[str, object]] = []
+    for idx, row in enumerate(source_rows):
+        base_context = extract_row_semantic_context(row, source_headers)
+        source_values: dict[str, str] = {}
+        for src_col, src_header in source_headers.items():
+            src_val = row.get(src_col)
+            if src_val in (None, ""):
+                continue
+            text = str(src_val).strip()
+            if len(text) > 240:
+                text = text[:240]
+            source_values[src_header] = text
+
+        rows_payload.append(
+            {
+                "row_index": idx,
+                "context": {
+                    **base_context,
+                    "source_values": source_values,
+                },
+            }
+        )
+
     system_prompt = (
-        "You generate product listing fields from product context. Return strict JSON only."
+        "You generate Walmart listing values from product context. "
+        "Return strict JSON only and fill as many target columns as possible."
     )
     user_prompt = json.dumps(
         {
-            "task": "Generate normalized fields for Walmart listing",
+            "task": "Generate values for target columns",
             "required_output": {
-                "values": {
-                    "productname": "string",
-                    "shortdescription": "string",
-                    "brand": "string",
-                    "price": "string",
-                    "sku": "string",
-                    "keyfeatures": ["string"],
-                }
+                "rows": [
+                    {
+                        "row_index": "int",
+                        "values_by_col": {
+                            "column_index_as_string": "string",
+                        },
+                    }
+                ]
             },
-            "context": semantic_context,
+            "target_columns": target_columns,
+            "rows": rows_payload,
             "constraints": [
-                "Do not invent brand if unknown, use Unbranded",
-                "Keep shortdescription <= 300 chars",
-                "Return keyfeatures as array of short bullet points",
+                "Use target column indexes from target_columns as keys in values_by_col",
+                "Only output non-empty values you are reasonably confident about",
+                "Keep each value concise and practical for listing fields",
+                "If unknown, omit that column from values_by_col",
             ],
         },
         ensure_ascii=False,
     )
 
-    data = call_ai_json(
-        provider=provider,
-        model=model,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        api_key_override=api_key_override,
-        base_url_override=base_url_override,
-        model_full=model_full,
-    )
-    values_obj = data.get("values")
-    if isinstance(values_obj, dict):
-        return cast(dict[str, object], values_obj)
-    return {}
+    merged_values: dict[int, dict[int, str]] = {}
+    warnings: list[str] = []
+
+    for start in range(0, len(rows_payload), AI_SYNTHESIS_BATCH_ROWS):
+        chunk = rows_payload[start : start + AI_SYNTHESIS_BATCH_ROWS]
+        chunk_prompt = json.dumps(
+            {
+                "task": "Generate values for target columns",
+                "required_output": {
+                    "rows": [
+                        {
+                            "row_index": "int",
+                            "values_by_col": {
+                                "column_index_as_string": "string",
+                            },
+                        }
+                    ]
+                },
+                "target_columns": target_columns,
+                "rows": chunk,
+            },
+            ensure_ascii=False,
+        )
+
+        data = call_ai_json(
+            provider=provider,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=chunk_prompt,
+            api_key_override=api_key_override,
+            base_url_override=base_url_override,
+            model_full=model_full,
+            expected_top_keys=["rows"],
+            max_tokens=1800,
+        )
+
+        fallback_reason = data.get("fallback_reason")
+        if isinstance(fallback_reason, str) and fallback_reason.strip():
+            warnings.append(fallback_reason.strip())
+
+        rows_obj = data.get("rows")
+        parsed_rows: list[dict[str, object]] = []
+        if isinstance(rows_obj, list):
+            for item in rows_obj:
+                if isinstance(item, dict):
+                    item_dict = cast(dict[object, object], item)
+                    parsed_rows.append(
+                        {
+                            "row_index": item_dict.get("row_index"),
+                            "values_by_col": item_dict.get("values_by_col"),
+                        }
+                    )
+        else:
+            values_by_row = data.get("values_by_row")
+            if isinstance(values_by_row, dict):
+                for row_key, values_obj in cast(dict[object, object], values_by_row).items():
+                    row_index: int | None = None
+                    if isinstance(row_key, str) and row_key.isdigit():
+                        row_index = int(row_key)
+                    elif isinstance(row_key, int):
+                        row_index = row_key
+                    if row_index is None:
+                        continue
+                    parsed_rows.append(
+                        {
+                            "row_index": row_index,
+                            "values_by_col": values_obj,
+                        }
+                    )
+            else:
+                # fallback: if model returned {"0": {"17":"..."}, ...}
+                top_level = cast(dict[object, object], data)
+                for row_key, values_obj in top_level.items():
+                    if row_key == "fallback_reason":
+                        continue
+                    row_index: int | None = None
+                    if isinstance(row_key, str) and row_key.isdigit():
+                        row_index = int(row_key)
+                    elif isinstance(row_key, int):
+                        row_index = row_key
+                    if row_index is not None:
+                        parsed_rows.append(
+                            {
+                                "row_index": row_index,
+                                "values_by_col": values_obj,
+                            }
+                        )
+
+                # single-row fallback: {"17":"value", "18":"value"}
+                if not parsed_rows and len(chunk) == 1:
+                    parsed_rows.append(
+                        {
+                            "row_index": start,
+                            "values_by_col": data,
+                        }
+                    )
+
+        for item in parsed_rows:
+            row_index_obj = item.get("row_index")
+            values_by_col_obj = item.get("values_by_col")
+            if not isinstance(row_index_obj, int):
+                continue
+            if row_index_obj < start or row_index_obj >= start + len(chunk):
+                continue
+            if not isinstance(values_by_col_obj, dict):
+                continue
+
+            row_values: dict[int, str] = {}
+            for col_key, raw_value in cast(dict[object, object], values_by_col_obj).items():
+                if not isinstance(col_key, str):
+                    continue
+                if not isinstance(raw_value, str):
+                    continue
+                value = raw_value.strip()
+                if not value:
+                    continue
+
+                if col_key.isdigit():
+                    col = int(col_key)
+                    if col in synthesis_targets:
+                        row_values[col] = value
+                    continue
+
+                header_key = normalize_header(col_key).replace(" ", "")
+                target_cols = target_cols_by_header.get(header_key, [])
+                if not target_cols:
+                    continue
+                for col in target_cols:
+                    if col not in row_values:
+                        row_values[col] = value
+                        break
+
+            if row_values:
+                merged_values[row_index_obj] = row_values
+
+    warning_text = ""
+    if warnings:
+        warning_text = warnings[0][:220]
+
+    return merged_values, warning_text
 
 
 def to_cell_value(value: object) -> CellValue:
@@ -952,13 +1375,59 @@ def has_opencode_openai_oauth() -> bool:
         return False
 
 
+def get_opencode_provider_secret(provider_name: str) -> str:
+    try:
+        auth_file = get_opencode_auth_file()
+        data_obj = cast(object, json.loads(auth_file.read_text(encoding="utf-8")))
+        if not isinstance(data_obj, dict):
+            return ""
+        data = cast(dict[object, object], data_obj)
+        provider_obj = data.get(provider_name)
+        if not isinstance(provider_obj, dict):
+            return ""
+        provider_dict = cast(dict[object, object], provider_obj)
+        ptype = provider_dict.get("type")
+        if isinstance(ptype, str) and ptype.lower() == "oauth":
+            access = provider_dict.get("access")
+            if isinstance(access, str):
+                return access.strip()
+            return ""
+        if isinstance(ptype, str) and ptype.lower() == "api":
+            key = provider_dict.get("key")
+            if isinstance(key, str):
+                return key.strip()
+            return ""
+        return ""
+    except Exception:
+        return ""
+
+
 def choose_stable_generation_channel(
     provider: str,
     model: str,
     api_key_override: str,
 ) -> tuple[str, str, str]:
     provider_key = provider.strip().lower()
+    if provider_key == "openai":
+        if api_key_override.strip():
+            return provider, model, "direct-key"
+        openai_env_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if openai_env_key:
+            return provider, model, "direct"
+        kimi_coding_key = get_opencode_provider_secret("kimi-for-coding")
+        if kimi_coding_key:
+            return "kimi-for-coding", "k2p5", "fallback-kimi-coding-api"
+
     if not is_supported_api_provider(provider_key):
+        openai_key = os.getenv("OPENAI_API_KEY", "").strip() or get_opencode_provider_secret("openai")
+        if openai_key:
+            return "openai", "gpt-4o-mini", "fallback-openai-oauth"
+        deepseek_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+        if deepseek_key:
+            return "deepseek", "deepseek-chat", "fallback-deepseek-env"
+        kimi_key = os.getenv("KIMI_API_KEY", os.getenv("MOONSHOT_API_KEY", "")).strip()
+        if kimi_key:
+            return "kimi", "moonshot-v1-8k", "fallback-kimi-env"
         return provider, model, "opencode-cli"
     if provider_key != "codex":
         return provider, model, "direct"
@@ -979,6 +1448,10 @@ def choose_stable_generation_channel(
     if kimi_key:
         return "kimi", "moonshot-v1-8k", "fallback-kimi-env"
 
+    kimi_coding_key = get_opencode_provider_secret("kimi-for-coding")
+    if kimi_coding_key:
+        return "kimi-for-coding", "k2p5", "fallback-kimi-coding-api"
+
     raise HTTPException(
         status_code=400,
         detail=(
@@ -993,6 +1466,7 @@ def call_codex_via_opencode_json(
     system_prompt: str,
     user_prompt: str,
     model_full: str | None = None,
+    expected_top_keys: list[str] | None = None,
 ) -> dict[str, object]:
     opencode_bin = resolve_opencode_executable()
     if model_full and model_full.strip():
@@ -1041,39 +1515,59 @@ def call_codex_via_opencode_json(
     except Exception:
         plain_context = safe_user_prompt
 
-    plain_task_prompt = (
-        "You are filling spreadsheet mappings.\n"
-        "Task: map EACH template header to the best source header using semantic meaning.\n"
-        "Use only provided source headers.\n"
-        "If uncertain, put it in unmapped_template_headers.\n"
-        "Return exactly one JSON object with this schema:\n"
-        "{\"mappings\":[{\"template_header\":string,\"source_header\":string,\"confidence\":number,\"reason\":string}],\"unmapped_template_headers\":[string]}\n"
-        f"Data:\n{plain_context}"
-    )
-
-    prompts = [
-        plain_task_prompt,
-        (
-            "You must answer using JSON only.\n"
-            "Schema: {\"mappings\":[{\"template_header\":string,\"source_header\":string,\"confidence\":number}],"
-            "\"unmapped_template_headers\":[string]}\n"
-            f"Context:\n{safe_user_prompt[:6000]}"
-        ),
-    ]
-
-    if compact_template_headers and compact_source_headers:
-        prompts.append(
-            "Map template headers to source headers now. "
-            "Output one JSON object with keys mappings and unmapped_template_headers only.\n"
-            f"Template headers: {compact_template_headers}\n"
-            f"Source headers: {compact_source_headers}"
+    expected_keys = expected_top_keys[:] if expected_top_keys else []
+    is_mapping_mode = "mappings" in expected_keys
+    if is_mapping_mode:
+        plain_task_prompt = (
+            "You are filling spreadsheet mappings.\n"
+            "Task: map EACH template header to the best source header using semantic meaning.\n"
+            "Use only provided source headers.\n"
+            "If uncertain, put it in unmapped_template_headers.\n"
+            "Return exactly one JSON object with this schema:\n"
+            "{\"mappings\":[{\"template_header\":string,\"source_header\":string,\"confidence\":number,\"reason\":string}],\"unmapped_template_headers\":[string]}\n"
+            f"Data:\n{plain_context}"
         )
 
-    prompts.append(
-        "Output JSON with EXACTLY these top-level keys only: mappings, unmapped_template_headers. "
-        "Do NOT output keys like intent_verbalization, status, message, summary, analysis, next_steps. "
-        "For mappings, either list objects [{template_header,source_header,confidence,reason}] or map object {template:source}."
-    )
+        prompts = [
+            plain_task_prompt,
+            (
+                "You must answer using JSON only.\n"
+                "Schema: {\"mappings\":[{\"template_header\":string,\"source_header\":string,\"confidence\":number}],"
+                "\"unmapped_template_headers\":[string]}\n"
+                f"Context:\n{safe_user_prompt[:6000]}"
+            ),
+        ]
+
+        if compact_template_headers and compact_source_headers:
+            prompts.append(
+                "Map template headers to source headers now. "
+                "Output one JSON object with keys mappings and unmapped_template_headers only.\n"
+                f"Template headers: {compact_template_headers}\n"
+                f"Source headers: {compact_source_headers}"
+            )
+
+        prompts.append(
+            "Output JSON with EXACTLY these top-level keys only: mappings, unmapped_template_headers. "
+            "Do NOT output keys like intent_verbalization, status, message, summary, analysis, next_steps. "
+            "For mappings, either list objects [{template_header,source_header,confidence,reason}] or map object {template:source}."
+        )
+    else:
+        keys_tip = ", ".join(expected_keys) if expected_keys else ""
+        prompts = [
+            (
+                "You must output final answer now. No acknowledgment. No markdown. JSON only.\n"
+                + (f"Required top-level keys: {keys_tip}.\n" if keys_tip else "")
+                + "If required keys are missing, output empty defaults instead of explanations.\n"
+                + f"Task instruction:\n{system_prompt[:500]}\n"
+                + f"Input JSON:\n{safe_user_prompt[:7500]}"
+            ),
+            (
+                "Output EXACT JSON object only. No extra keys. No status or message fields.\n"
+                + (f"Must include keys: {keys_tip}.\n" if keys_tip else "")
+                + "Example shape: {\"rows\":[{\"row_index\":0,\"values_by_col\":{\"17\":\"value\"}}]}\n"
+                + f"Now transform this input:\n{safe_user_prompt[:5000]}"
+            ),
+        ]
 
     last_error = ""
     fallback_unmapped_headers: list[str] = []
@@ -1128,37 +1622,192 @@ def call_codex_via_opencode_json(
         output = strip_ansi("\n".join(text_parts))
         try:
             parsed = extract_json_from_text(output)
-            if "mappings" in parsed:
+            if not expected_keys:
                 return parsed
-            last_error = "JSON missing mappings key"
+            if all(key in parsed for key in expected_keys):
+                return parsed
+            if not is_mapping_mode and parsed:
+                parsed["fallback_reason"] = f"missing-keys:{expected_keys}"
+                return parsed
+            last_error = f"JSON missing required keys: {expected_keys}"
             continue
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)
             continue
 
-    return {
-        "mappings": [],
-        "unmapped_template_headers": fallback_unmapped_headers,
-        "fallback_reason": f"opencode-parse-failed:{last_error[:120]}",
-    }
+    if is_mapping_mode:
+        return {
+            "mappings": [],
+            "unmapped_template_headers": fallback_unmapped_headers,
+            "fallback_reason": f"opencode-parse-failed:{last_error[:120]}",
+        }
+
+    fallback: dict[str, object] = {"fallback_reason": f"opencode-parse-failed:{last_error[:120]}"}
+    for key in expected_keys:
+        fallback[key] = [] if key.endswith("s") else {}
+    return fallback
+
+
+def run_opencode_text_prompt(
+    *,
+    model: str,
+    prompt: str,
+    model_full: str | None,
+    timeout_seconds: int = 120,
+) -> str:
+    opencode_bin = resolve_opencode_executable()
+    if model_full and model_full.strip():
+        normalized_model = model_full.strip()
+    else:
+        normalized_model = model if "/" in model else f"openai/{model}"
+
+    result = subprocess.run(
+        [opencode_bin, "run", "--format", "json", "--model", normalized_model, prompt],
+        cwd=str(BASE_DIR),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        timeout=timeout_seconds,
+        check=False,
+    )
+
+    text_parts: list[str] = []
+    for line in (result.stdout or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            event_obj = cast(object, json.loads(stripped))
+        except Exception:
+            continue
+        if not isinstance(event_obj, dict):
+            continue
+        event_dict = cast(dict[object, object], event_obj)
+        part_obj = event_dict.get("part")
+        if not isinstance(part_obj, dict):
+            continue
+        part_dict = cast(dict[object, object], part_obj)
+        text_obj = part_dict.get("text")
+        if isinstance(text_obj, str):
+            text_parts.append(text_obj)
+
+    return strip_ansi("\n".join(text_parts)).strip()
+
+
+def ai_synthesize_rows_via_opencode_text(
+    *,
+    synthesis_targets: dict[int, str],
+    source_rows: list[dict[int, CellValue]],
+    source_headers: dict[int, str],
+    model: str,
+    model_full: str | None,
+) -> tuple[dict[int, dict[int, str]], str]:
+    if not synthesis_targets or not source_rows:
+        return {}, ""
+
+    priority_tokens = (
+        "shortdescription",
+        "keyfeature",
+        "feature",
+        "material",
+        "color",
+        "size",
+        "manufacturer",
+        "modelnumber",
+        "manufacturerpartnumber",
+        "itemsincluded",
+        "countperpack",
+        "piececount",
+        "netcontentstatement",
+        "occasion",
+        "pattern",
+        "productline",
+        "warrantytext",
+        "theme",
+        "collection",
+        "condition",
+        "quantity",
+    )
+
+    def score_target(name: str, col: int) -> tuple[int, int]:
+        for idx, token in enumerate(priority_tokens):
+            if token in name:
+                return idx, col
+        return 999, col
+
+    ranked_targets = sorted(synthesis_targets.items(), key=lambda item: score_target(item[1], item[0]))
+    limited_targets = dict(ranked_targets[:14])
+    merged: dict[int, dict[int, str]] = {}
+    first_error = ""
+
+    for idx, source_row in enumerate(source_rows):
+        ctx = extract_row_semantic_context(source_row, source_headers)
+        row_values: dict[int, str] = {}
+        for col, header_name in limited_targets.items():
+            single_prompt = (
+                "Generate one concise value for Walmart listing field. "
+                "Output plain text only. If unknown output UNKNOWN.\n"
+                f"field={header_name}\n"
+                f"title={ctx.get('title', '')[:180]}\n"
+                f"selling_points={ctx.get('selling_points', '')[:280]}\n"
+                f"details={ctx.get('details', '')[:220]}\n"
+                f"price={ctx.get('price', '')}\n"
+                f"sku={ctx.get('sku', '')}"
+            )
+            try:
+                one_value = run_opencode_text_prompt(
+                    model=model,
+                    model_full=model_full,
+                    prompt=single_prompt,
+                    timeout_seconds=45,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if not first_error:
+                    first_error = str(exc)
+                continue
+
+            cleaned = one_value.strip().splitlines()[0].strip() if one_value.strip() else ""
+            if not cleaned:
+                continue
+            cleaned_upper = cleaned.upper()
+            if cleaned_upper in {"UNKNOWN", "N/A", "NONE", "NULL", "UNSURE"}:
+                continue
+            if len(cleaned) > 160:
+                cleaned = cleaned[:160]
+            if "=" in cleaned and len(cleaned.split("=")) == 2:
+                cleaned = cleaned.split("=", 1)[1].strip()
+            if not cleaned:
+                continue
+            row_values[col] = cleaned
+
+        if row_values:
+            merged[idx] = row_values
+
+    warning = ""
+    if not merged and first_error:
+        warning = first_error[:220]
+    return merged, warning
 
 
 def resolve_completed_dir(requested_dir: str) -> Path:
-    default_path = (BASE_DIR / DEFAULT_COMPLETED_DIR).resolve()
-    if not default_path.exists() or not default_path.is_dir():
-        raise HTTPException(status_code=400, detail=f"Completed dir not found: {DEFAULT_COMPLETED_DIR}")
-
     requested = requested_dir.strip()
     if not requested:
-        return default_path
+        requested = DEFAULT_COMPLETED_DIR
 
     candidate = (BASE_DIR / requested).resolve()
-    if candidate != default_path:
+    try:
+        candidate.relative_to(BASE_DIR)
+    except Exception:
         raise HTTPException(
             status_code=400,
-            detail=f"completed_dir is restricted to: {DEFAULT_COMPLETED_DIR}",
+            detail="completed_dir must be a subdirectory under current project",
         )
-    return default_path
+
+    if not candidate.exists() or not candidate.is_dir():
+        raise HTTPException(status_code=400, detail=f"Completed dir not found: {requested}")
+
+    return candidate
 
 
 def sheet_to_rows(sheet: Worksheet, header_row: int) -> list[dict[int, CellValue]]:
@@ -1212,28 +1861,665 @@ def write_cell_if_writable(
     return True
 
 
+def build_requirement_hints(template_header: HeaderInfo, sheet: Worksheet) -> dict[int, str]:
+    requirement_row = template_header.row_index + 1
+    hints: dict[int, str] = {}
+    for col in template_header.by_col:
+        raw = sheet.cell(row=requirement_row, column=col).value
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text:
+            hints[col] = text
+    return hints
+
+
+def build_hidden_valid_values_catalog(workbook: Workbook) -> dict[str, list[str]]:
+    catalog: dict[str, list[str]] = {}
+    target_sheet: Worksheet | None = None
+    for ws in workbook.worksheets:
+        if ws.sheet_state == "hidden" and "hidden_product_content" in ws.title.lower():
+            target_sheet = ws
+            break
+    if target_sheet is None:
+        return catalog
+
+    header_row = 22
+    values_start_row = 23
+    if target_sheet.cell(header_row, 1).value not in ("valid values header", "Valid values header"):
+        return catalog
+
+    for col in range(1, target_sheet.max_column + 1):
+        raw_header = target_sheet.cell(header_row, col).value
+        if raw_header is None:
+            continue
+        header_text = str(raw_header).strip()
+        if not header_text:
+            continue
+
+        values: list[str] = []
+        blank_streak = 0
+        for row in range(values_start_row, target_sheet.max_row + 1):
+            raw = target_sheet.cell(row, col).value
+            if raw in (None, ""):
+                blank_streak += 1
+                if blank_streak >= 3 and values:
+                    break
+                continue
+            blank_streak = 0
+            text = str(raw).strip()
+            if text:
+                values.append(text)
+
+        if values:
+            key = normalize_header(header_text).replace(" ", "")
+            if key:
+                catalog[key] = dedupe_preserve_order(values)
+
+    return catalog
+
+
+def make_dynamic_dropdown_key_part(text: str) -> str:
+    part = text.strip()
+    part = part.replace(" ", "_")
+    part = re.sub(r"[&,'()\-/\\]", "", part)
+    part = re.sub(r"_+", "_", part).strip("_")
+    if part and part[0].isdigit():
+        part = f"_{part}"
+    return part
+
+
+def resolve_dynamic_dropdown_options(
+    *,
+    workbook: Workbook,
+    sheet: Worksheet,
+    row: int,
+    col: int,
+    formula: str,
+    header_name: str,
+    spec_product_type_col: int | None,
+    hidden_valid_catalog: dict[str, list[str]],
+) -> list[str]:
+    expr = formula.strip()
+    if expr.startswith("="):
+        expr = expr[1:]
+
+    indirect_m = re.match(r"(?i)^INDIRECT\((.*)\)$", expr)
+    inner = indirect_m.group(1).strip() if indirect_m else expr
+
+    key_candidates: list[str] = []
+
+    # INDIRECT("literal")
+    literal_m = re.match(r'^"([^"]+)"$', inner)
+    if literal_m:
+        literal = literal_m.group(1)
+        key_candidates.append(normalize_header(literal).replace(" ", ""))
+
+    # INDIRECT($CY$5) style
+    ref5_m = re.match(r"^\$?([A-Z]+)\$?5$", inner, flags=re.IGNORECASE)
+    if ref5_m:
+        col_letters = ref5_m.group(1).upper()
+        ref_col = column_index_from_string(col_letters)
+        ref_header = sheet.cell(row=5, column=ref_col).value
+        if ref_header is not None:
+            key_candidates.append(normalize_header(str(ref_header)).replace(" ", ""))
+
+    # Product type + header dynamic key from IF($E7..., ..., $CE$5)
+    if "IF($E" in inner or "$E" in inner:
+        spec_text = ""
+        if spec_product_type_col is not None:
+            raw = sheet.cell(row=row, column=spec_product_type_col).value
+            if raw not in (None, ""):
+                spec_text = str(raw).strip()
+        header_ref_part = header_name
+        literal_suffix = ""
+        literal_suffix_m = re.search(r'"([A-Za-z0-9_]+(?:unit|measure|type))"', inner, flags=re.IGNORECASE)
+        if literal_suffix_m:
+            literal_suffix = literal_suffix_m.group(1)
+            header_ref_part = literal_suffix
+        ref_in_inner = re.search(r"\$([A-Z]+)\$5", inner, flags=re.IGNORECASE)
+        if ref_in_inner:
+            ref_col = column_index_from_string(ref_in_inner.group(1).upper())
+            raw_header_ref = sheet.cell(row=5, column=ref_col).value
+            if raw_header_ref not in (None, ""):
+                header_ref_part = str(raw_header_ref)
+        if spec_text:
+            head_part = make_dynamic_dropdown_key_part(header_ref_part)
+            spec_part = make_dynamic_dropdown_key_part(spec_text)
+            if head_part and spec_part:
+                joined = f"{spec_part}_{head_part}"
+                key_candidates.append(normalize_header(joined).replace(" ", ""))
+        if literal_suffix:
+            key_candidates.append(normalize_header(literal_suffix).replace(" ", ""))
+
+    # always try header itself
+    key_candidates.append(normalize_header(header_name).replace(" ", ""))
+
+    for key in key_candidates:
+        if key in hidden_valid_catalog and hidden_valid_catalog[key]:
+            return hidden_valid_catalog[key]
+
+    # suffix fallback: choose category-specific key ending with current header token.
+    header_tail = normalize_header(header_name).replace(" ", "")
+    if header_tail:
+        matches = [k for k in hidden_valid_catalog.keys() if k.endswith(header_tail)]
+        if matches:
+            spec_norm = ""
+            if spec_product_type_col is not None:
+                raw_spec = sheet.cell(row=row, column=spec_product_type_col).value
+                if raw_spec not in (None, ""):
+                    spec_norm = normalize_header(str(raw_spec)).replace(" ", "")
+            if spec_norm:
+                for k in matches:
+                    if spec_norm in k:
+                        vals = hidden_valid_catalog.get(k, [])
+                        if vals:
+                            return vals
+            if len(matches) == 1:
+                vals = hidden_valid_catalog.get(matches[0], [])
+                if vals:
+                    return vals
+
+    return []
+
+
+def infer_data_start_row(template_header: HeaderInfo, sheet: Worksheet) -> int:
+    candidate_row = template_header.row_index + 1
+    total = 0
+    rule_like = 0
+    italic_non_empty = 0
+    markers = [
+        "alphanumeric",
+        "closed list",
+        "decimal",
+        "characters",
+        "example",
+        "value range",
+        "provide",
+        "gtin",
+    ]
+
+    for col in template_header.by_col:
+        raw = sheet.cell(row=candidate_row, column=col).value
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        total += 1
+        lower = text.lower()
+        if any(marker in lower for marker in markers):
+            rule_like += 1
+        font_obj = sheet.cell(row=candidate_row, column=col).font
+        if font_obj is not None and bool(getattr(font_obj, "italic", False)):
+            italic_non_empty += 1
+
+    looks_like_definition = False
+    if total > 0:
+        marker_ratio = rule_like / total
+        italic_ratio = italic_non_empty / total
+        if marker_ratio >= 0.2:
+            looks_like_definition = True
+        if italic_ratio >= 0.6 and total >= 6:
+            looks_like_definition = True
+
+    data_start = candidate_row + 1 if looks_like_definition else candidate_row
+    fallback_start = data_start
+
+    # Scan only a limited window to avoid jumping too far.
+    scan_limit = min(sheet.max_row, data_start + 30)
+    while data_start <= scan_limit:
+        has_value = False
+        for col in template_header.by_col:
+            raw = sheet.cell(row=data_start, column=col).value
+            if raw not in (None, ""):
+                has_value = True
+                break
+        if has_value:
+            return data_start
+        data_start += 1
+
+    return fallback_start
+
+
+def extract_dropdown_options_for_cell(
+    workbook: Workbook,
+    sheet: Worksheet,
+    row: int,
+    col: int,
+    header_name: str,
+    spec_product_type_col: int | None,
+    hidden_valid_catalog: dict[str, list[str]],
+) -> list[str]:
+    coord = sheet.cell(row=row, column=col).coordinate
+    dv_container = sheet.data_validations
+    if dv_container is None or not dv_container.dataValidation:
+        return []
+
+    options: list[str] = []
+    for dv in dv_container.dataValidation:
+        if dv.type != "list":
+            continue
+        try:
+            in_range = coord in dv.ranges
+        except Exception:
+            in_range = False
+        if not in_range:
+            continue
+
+        formula = (dv.formula1 or "").strip()
+        if not formula:
+            continue
+        if formula.startswith("="):
+            formula = formula[1:]
+
+        if formula.startswith('"') and formula.endswith('"'):
+            for item in formula[1:-1].split(","):
+                text = item.strip()
+                if text:
+                    options.append(text)
+            continue
+
+        if "!" in formula:
+            sheet_part, ref_part = formula.split("!", 1)
+            sheet_name = sheet_part.strip().strip("'")
+            ref = ref_part.strip().replace("$", "")
+            if sheet_name in workbook.sheetnames:
+                ref_sheet = workbook[sheet_name]
+                try:
+                    min_col, min_row, max_col, max_row = range_boundaries(ref)
+                except Exception:
+                    continue
+                if None in (min_col, min_row, max_col, max_row):
+                    continue
+                start_col = cast(int, min_col)
+                start_row = cast(int, min_row)
+                end_col = cast(int, max_col)
+                end_row = cast(int, max_row)
+                for r in range(start_row, end_row + 1):
+                    for c in range(start_col, end_col + 1):
+                        raw = ref_sheet.cell(row=r, column=c).value
+                        if raw is None:
+                            continue
+                        text = str(raw).strip()
+                        if text:
+                            options.append(text)
+            continue
+
+        # named range fallback
+        try:
+            defined = workbook.defined_names.get(formula)
+            if defined is not None:
+                for title, ref in defined.destinations:
+                    if title not in workbook.sheetnames:
+                        continue
+                    ref_sheet = workbook[title]
+                    ref_clean = ref.replace("$", "")
+                    min_col, min_row, max_col, max_row = range_boundaries(ref_clean)
+                    if None in (min_col, min_row, max_col, max_row):
+                        continue
+                    start_col = cast(int, min_col)
+                    start_row = cast(int, min_row)
+                    end_col = cast(int, max_col)
+                    end_row = cast(int, max_row)
+                    for r in range(start_row, end_row + 1):
+                        for c in range(start_col, end_col + 1):
+                            raw = ref_sheet.cell(row=r, column=c).value
+                            if raw is None:
+                                continue
+                            text = str(raw).strip()
+                            if text:
+                                options.append(text)
+        except Exception:
+            pass
+
+        # dynamic formula fallback (INDIRECT/IF based)
+        dynamic_options = resolve_dynamic_dropdown_options(
+            workbook=workbook,
+            sheet=sheet,
+            row=row,
+            col=col,
+            formula=formula,
+            header_name=header_name,
+            spec_product_type_col=spec_product_type_col,
+            hidden_valid_catalog=hidden_valid_catalog,
+        )
+        if dynamic_options:
+            options.extend(dynamic_options)
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in options:
+        key = normalize_header(item)
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
+
+
+def cell_has_list_validation(sheet: Worksheet, row: int, col: int) -> bool:
+    coord = sheet.cell(row=row, column=col).coordinate
+    dv_container = sheet.data_validations
+    if dv_container is None or not dv_container.dataValidation:
+        return False
+    for dv in dv_container.dataValidation:
+        if dv.type != "list":
+            continue
+        try:
+            if coord in dv.ranges:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def pick_best_dropdown_option(candidate: str, options: list[str]) -> str | None:
+    if not options:
+        return None
+    cand_key = normalize_header(candidate)
+    if not cand_key:
+        return None
+
+    exact = {normalize_header(opt): opt for opt in options}
+    return exact.get(cand_key)
+
+
+def sanitize_value_by_requirement(value: CellValue, requirement_text: str, header_name: str = "") -> str:
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return ""
+
+    rule = requirement_text.lower()
+    header_key = normalize_header(header_name).replace(" ", "")
+    descriptive_field = any(
+        token in header_key
+        for token in ["description", "keyfeature", "features", "productname", "brand", "material", "theme", "pattern"]
+    )
+
+    if "decimal" in rule:
+        m = re.search(r"-?\d+(?:\.\d+)?", text)
+        if m:
+            text = m.group(0)
+        else:
+            return ""
+
+    if "integer" in rule:
+        m = re.search(r"-?\d+", text)
+        if m:
+            text = m.group(0)
+        else:
+            return ""
+
+    if "alphanumeric" in rule and not descriptive_field:
+        text = re.sub(r"[^A-Za-z0-9]", "", text)
+
+    if "gtin-14" in rule:
+        digits = re.sub(r"\D", "", text)
+        if not digits:
+            return ""
+        if len(digits) < 14:
+            digits = digits.zfill(14)
+        text = digits[:14]
+    elif "gtin-12" in rule or "upc" in rule:
+        digits = re.sub(r"\D", "", text)
+        if digits:
+            if len(digits) < 12:
+                digits = digits.zfill(12)
+            text = digits[:12]
+
+    char_match = re.search(r"(\d+)\s*characters?", rule)
+    if char_match:
+        limit = int(char_match.group(1))
+        if limit > 0:
+            text = text[:limit]
+
+    return text.strip()
+
+
+def write_cell_with_constraints(
+    *,
+    workbook: Workbook,
+    sheet: Worksheet,
+    row: int,
+    col: int,
+    value: CellValue,
+    header_name: str,
+    header_row_index: int,
+    requirement_hints: dict[int, str],
+    dropdown_cache: dict[tuple[int, int], list[str]],
+    spec_product_type_col: int | None,
+    hidden_valid_catalog: dict[str, list[str]],
+) -> tuple[bool, str]:
+    target_cell = resolve_writable_cell(sheet, row, col)
+    if target_cell is None:
+        return False, "non-writable"
+
+    requirement_text = requirement_hints.get(col, "")
+    candidate_text = sanitize_value_by_requirement(value, requirement_text, header_name)
+    hkey = normalize_header(header_name).replace(" ", "")
+
+    def infer_generic_unit_default() -> str | None:
+        if hkey != "unit":
+            return None
+        top_header_row = max(1, header_row_index - 2)
+        nearby_keys: list[str] = []
+        candidate_cells: list[tuple[int, int]] = [
+            (top_header_row, col - 1),
+            (top_header_row, col - 2),
+            (header_row_index - 1, col - 1),
+            (header_row_index, col - 1),
+            (header_row_index - 1, col - 2),
+            (header_row_index, col - 2),
+        ]
+        for rr, cc in candidate_cells:
+            if rr < 1 or cc < 1:
+                continue
+            raw_near = sheet.cell(row=rr, column=cc).value
+            if raw_near in (None, ""):
+                continue
+            nearby_keys.append(normalize_header(str(raw_near)).replace(" ", ""))
+
+        if not nearby_keys:
+            return None
+
+        merged = " ".join(nearby_keys)
+        has_weight_context = any(tok in merged for tok in ["weight", "mass"])
+        has_dimension_context = any(tok in merged for tok in ["length", "height", "width", "depth", "dimension"])
+        if has_weight_context and not has_dimension_context:
+            return "lb"
+        if has_dimension_context and not has_weight_context:
+            return "in"
+
+        if col > 1:
+            raw_left_top = sheet.cell(row=top_header_row, column=col - 1).value
+            if raw_left_top not in (None, ""):
+                left_top = normalize_header(str(raw_left_top)).replace(" ", "")
+                if any(tok in left_top for tok in ["weight", "mass"]):
+                    return "lb"
+                if any(tok in left_top for tok in ["length", "height", "width", "depth", "dimension"]):
+                    return "in"
+
+        return None
+
+    inferred_unit = infer_generic_unit_default()
+    if inferred_unit:
+        candidate_text = inferred_unit
+
+    key = (row, col)
+    options = dropdown_cache.get(key)
+    if options is None:
+        options = extract_dropdown_options_for_cell(
+            workbook,
+            sheet,
+            row,
+            col,
+            header_name,
+            spec_product_type_col,
+            hidden_valid_catalog,
+        )
+        dropdown_cache[key] = options
+
+    has_dropdown = cell_has_list_validation(sheet, row, col)
+    if has_dropdown and not options:
+        return False, "dropdown-unresolved"
+
+    if options:
+        # If this dropdown has only one valid value, use it directly.
+        if len(options) == 1:
+            target_cell.value = options[0]
+            return True, "ok"
+
+        # If source/model value is empty, try dropdown-safe defaults first.
+        if not candidate_text:
+            chosen_default = choose_dropdown_default_for_header(header_name, requirement_text, options)
+            if chosen_default:
+                target_cell.value = chosen_default
+                return True, "ok"
+            return False, "dropdown-no-match"
+
+        # Strict single-select support: if model returned combined values like "color,size",
+        # keep only one valid option.
+        if re.search(r"[,;|]", candidate_text):
+            parts = [p.strip() for p in re.split(r"[,;|]+", candidate_text) if p.strip()]
+            for part in parts:
+                chosen_part = pick_best_dropdown_option(part, options)
+                if chosen_part:
+                    target_cell.value = chosen_part
+                    return True, "ok"
+
+        hkey = normalize_header(header_name).replace(" ", "")
+        # Generic unit columns (header often equals just "unit"): infer by nearby measure header first.
+        if hkey == "unit":
+            nearby_keys: list[str] = []
+            top_header_row = max(1, header_row_index - 2)
+            candidate_cells: list[tuple[int, int]] = [
+                (top_header_row, col - 1),
+                (top_header_row, col - 2),
+                (header_row_index - 1, col - 1),
+                (header_row_index, col - 1),
+                (header_row_index - 1, col - 2),
+                (header_row_index, col - 2),
+            ]
+            for rr, cc in candidate_cells:
+                if rr < 1 or cc < 1:
+                    continue
+                raw_near = sheet.cell(row=rr, column=cc).value
+                if raw_near in (None, ""):
+                    continue
+                nearby_keys.append(normalize_header(str(raw_near)).replace(" ", ""))
+
+            merged_nearby = " ".join(nearby_keys)
+            has_weight_context = any(tok in merged_nearby for tok in ["weight", "mass"])
+            has_dimension_context = any(tok in merged_nearby for tok in ["length", "height", "width", "depth", "dimension"])
+
+            if has_weight_context and not has_dimension_context:
+                picked = choose_dropdown_default_for_header("weightunit", requirement_text, options)
+                if picked:
+                    target_cell.value = picked
+                    return True, "ok"
+            if has_dimension_context and not has_weight_context:
+                picked = choose_dropdown_default_for_header("lengthunit", requirement_text, options)
+                if picked:
+                    target_cell.value = picked
+                    return True, "ok"
+
+            # Mixed context fallback: prefer immediate left top-header semantic (row above Measure/Unit rows).
+            left_top = ""
+            if col > 1:
+                raw_left_top = sheet.cell(row=top_header_row, column=col - 1).value
+                if raw_left_top not in (None, ""):
+                    left_top = normalize_header(str(raw_left_top)).replace(" ", "")
+            if any(tok in left_top for tok in ["weight", "mass"]):
+                picked = choose_dropdown_default_for_header("weightunit", requirement_text, options)
+                if picked:
+                    target_cell.value = picked
+                    return True, "ok"
+            if any(tok in left_top for tok in ["length", "height", "width", "depth", "dimension"]):
+                picked = choose_dropdown_default_for_header("lengthunit", requirement_text, options)
+                if picked:
+                    target_cell.value = picked
+                    return True, "ok"
+
+        # Field-specific dropdown defaults (strictly from available options only).
+        chosen_default = choose_dropdown_default_for_header(header_name, requirement_text, options)
+        if chosen_default:
+            target_cell.value = chosen_default
+            return True, "ok"
+
+        if hkey == "specproducttype" and candidate_text:
+            best_opt = ""
+            best_score = 0.0
+            cand_key = normalize_header(candidate_text)
+            for opt in options:
+                opt_key = normalize_header(opt)
+                if not opt_key:
+                    continue
+                score = SequenceMatcher(None, cand_key, opt_key).ratio()
+                if cand_key in opt_key or opt_key in cand_key:
+                    score = max(score, 0.8)
+                if score > best_score:
+                    best_score = score
+                    best_opt = opt
+            if best_opt and best_score >= 0.45:
+                target_cell.value = best_opt
+                return True, "ok"
+
+        chosen = pick_best_dropdown_option(candidate_text, options)
+        if not chosen:
+            return False, "dropdown-no-match"
+        target_cell.value = chosen
+        return True, "ok"
+
+    if not candidate_text:
+        return False, "constraint-empty"
+
+    target_cell.value = candidate_text
+    return True, "ok"
+
+
 def fill_template(
+    workbook: Workbook,
     template_sheet: Worksheet,
     template_header: HeaderInfo,
     source_rows: list[dict[int, CellValue]],
     mapping: dict[int, int],
-) -> tuple[int, int, set[int]]:
-    write_row = template_header.row_index + 1
+    requirement_hints: dict[int, str],
+    dropdown_cache: dict[tuple[int, int], list[str]],
+    data_start_row: int,
+    spec_product_type_col: int | None,
+    hidden_valid_catalog: dict[str, list[str]],
+) -> tuple[int, int, set[int], int]:
+    write_row = data_start_row
     skipped_writes = 0
     skipped_cols: set[int] = set()
+    constraint_skipped = 0
     for source_row in source_rows:
-        for tpl_col, src_col in mapping.items():
-            written = write_cell_if_writable(
-                template_sheet,
-                write_row,
-                tpl_col,
-                source_row.get(src_col),
+        ordered_tpl_cols = sorted(
+            mapping.keys(),
+            key=lambda c: (0 if spec_product_type_col is not None and c == spec_product_type_col else 1, c),
+        )
+        for tpl_col in ordered_tpl_cols:
+            src_col = mapping[tpl_col]
+            written, reason = write_cell_with_constraints(
+                workbook=workbook,
+                sheet=template_sheet,
+                row=write_row,
+                col=tpl_col,
+                value=source_row.get(src_col),
+                header_name=template_header.by_col.get(tpl_col, ""),
+                header_row_index=template_header.row_index,
+                requirement_hints=requirement_hints,
+                dropdown_cache=dropdown_cache,
+                spec_product_type_col=spec_product_type_col,
+                hidden_valid_catalog=hidden_valid_catalog,
             )
             if not written:
                 skipped_writes += 1
                 skipped_cols.add(tpl_col)
+                if reason in {"dropdown-no-match", "constraint-empty"}:
+                    constraint_skipped += 1
         write_row += 1
-    return max(0, write_row - (template_header.row_index + 1)), skipped_writes, skipped_cols
+    return max(0, write_row - data_start_row), skipped_writes, skipped_cols, constraint_skipped
 
 
 def normalize_cell_for_match(value: CellValue) -> str:
@@ -1793,22 +3079,16 @@ async def learn_rules_from_folder(
     if min_support < 1:
         raise HTTPException(status_code=400, detail="min_support must be >= 1")
 
-    if product_file is not None:
-        if not product_file.filename or not product_file.filename.lower().endswith(".xlsx"):
-            raise HTTPException(status_code=400, detail="product_file must be .xlsx")
-        product_bytes = await product_file.read()
-        try:
-            product_wb = load_workbook(io.BytesIO(product_bytes), data_only=True)
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=400, detail=f"Invalid product workbook: {exc}") from exc
-    else:
-        default_product = BASE_DIR / "沃尔玛产品信息表.xlsx"
-        if not default_product.exists():
-            raise HTTPException(
-                status_code=400,
-                detail="No product_file uploaded and default product sheet not found",
-            )
-        product_wb = load_workbook(default_product, data_only=True)
+    if product_file is None:
+        raise HTTPException(status_code=400, detail="product_file is required; no local default fallback is used")
+
+    if not product_file.filename or not product_file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="product_file must be .xlsx")
+    product_bytes = await product_file.read()
+    try:
+        product_wb = load_workbook(io.BytesIO(product_bytes), data_only=True)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Invalid product workbook: {exc}") from exc
 
     product_sheet = product_wb.active
     if not isinstance(product_sheet, Worksheet):
@@ -1945,6 +3225,32 @@ async def autofill(
     ai_synthesis_mode = "model"
     ai_synthesized_cells = 0
     ai_synth_skipped_cells = 0
+    constraint_skipped_total = 0
+    requirement_hints = build_requirement_hints(template_header, template_sheet)
+    data_start_row = infer_data_start_row(template_header, template_sheet)
+    spec_product_type_col: int | None = None
+    for col, header in template_header.by_col.items():
+        key = normalize_header(header).replace(" ", "")
+        if key == "specproducttype":
+            spec_product_type_col = col
+            break
+    hidden_valid_catalog = build_hidden_valid_values_catalog(template_wb)
+    dropdown_cache: dict[tuple[int, int], list[str]] = {}
+    target_allowed_options: dict[int, list[str]] = {}
+    for col, name in template_header.by_col.items():
+        if col in mapping:
+            continue
+        opts = extract_dropdown_options_for_cell(
+            template_wb,
+            template_sheet,
+            data_start_row,
+            col,
+            name,
+            spec_product_type_col,
+            hidden_valid_catalog,
+        )
+        if opts:
+            target_allowed_options[col] = opts
 
     source_rows = sheet_to_rows(product_sheet, product_header.row_index)
     if not source_rows:
@@ -2049,45 +3355,93 @@ async def autofill(
                 if "please provide API Key" in ai_warning:
                     ai_route_mode = "blocked-no-key"
 
+    if use_ai:
+        ai_rewrite_tokens = ("keyfeature", "features", "sitedescription", "shortdescription")
+        remove_cols: list[int] = []
+        for tpl_col, src_col in mapping.items():
+            tpl_key = normalize_header(template_header.by_col.get(tpl_col, "")).replace(" ", "")
+            if not any(token in tpl_key for token in ai_rewrite_tokens):
+                continue
+            policy = rule_policies.get(tpl_key, {"allow_ai": True, "skip": False})
+            if policy.get("skip", False):
+                continue
+            if not policy.get("allow_ai", True):
+                continue
+            _ = src_col
+            remove_cols.append(tpl_col)
+        for col in remove_cols:
+            _ = mapping.pop(col, None)
+
     ai_added_columns = max(0, len(mapping) - base_mapped_count)
 
     synthesis_targets = infer_synthesis_targets(template_header.by_col, mapping, rule_policies)
     synthesized_cols: set[int] = set()
     use_model_synthesis = True
-    resolved_key = ""
-    if is_supported_api_provider(effective_ai_provider):
+    ai_synthesis_batch_values: dict[int, dict[int, str]] = {}
+    ai_synthesis_warning = ""
+    if not use_ai:
+        use_model_synthesis = False
+    if use_model_synthesis:
+        ai_synthesis_mode = "model-batch"
         try:
-            _p, resolved_key, _u, _e = get_ai_provider_config(
-                effective_ai_provider,
+            ai_synthesis_batch_values, ai_synthesis_warning = ai_synthesize_batch_values(
+                synthesis_targets=synthesis_targets,
+                source_rows=source_rows,
+                source_headers=product_header.by_col,
+                provider=effective_ai_provider,
+                model=effective_ai_model,
                 api_key_override=ai_api_key,
                 base_url_override=ai_base_url,
+                model_full=selected_model_full,
+                target_requirements=requirement_hints,
+                target_allowed_options=target_allowed_options,
             )
-        except HTTPException:
-            resolved_key = ""
-    if not is_supported_api_provider(effective_ai_provider):
-        use_model_synthesis = False
+        except HTTPException as exc:
+            use_model_synthesis = False
+            ai_synthesis_mode = "local-fallback"
+            ai_synthesis_warning = str(exc.detail)
+
+    if use_model_synthesis and (not ai_synthesis_batch_values or ai_synthesis_warning):
+        text_values, text_warning = ai_synthesize_rows_via_opencode_text(
+            synthesis_targets=synthesis_targets,
+            source_rows=source_rows,
+            source_headers=product_header.by_col,
+            model=effective_ai_model,
+            model_full=selected_model_full if selected_model_full else f"{effective_ai_provider}/{effective_ai_model}",
+        )
+        if text_values:
+            for row_idx, row_values in text_values.items():
+                existing = ai_synthesis_batch_values.get(row_idx, {})
+                existing.update(row_values)
+                ai_synthesis_batch_values[row_idx] = existing
+            ai_synthesis_mode = "model-opencode-text"
+            ai_synthesis_warning = ""
+        elif text_warning and not ai_synthesis_warning:
+            ai_synthesis_warning = text_warning
+
+    if not use_model_synthesis:
         ai_synthesis_mode = "local-fallback"
-    elif effective_ai_provider in {"openai", "codex"} and not resolved_key:
-        use_model_synthesis = False
-        ai_synthesis_mode = "local-fallback"
+
+    if (not use_model_synthesis) and synthesis_targets and selected_model_full:
+        text_values, text_warning = ai_synthesize_rows_via_opencode_text(
+            synthesis_targets=synthesis_targets,
+            source_rows=source_rows,
+            source_headers=product_header.by_col,
+            model=effective_ai_model,
+            model_full=selected_model_full,
+        )
+        if text_values:
+            ai_synthesis_batch_values = text_values
+            use_model_synthesis = True
+            ai_synthesis_mode = "model-opencode-text"
+            ai_synthesis_warning = ""
+        elif text_warning and not ai_synthesis_warning:
+            ai_synthesis_warning = text_warning
+
     if use_ai and synthesis_targets:
         for idx, source_row in enumerate(source_rows):
-            write_row = template_header.row_index + 1 + idx
+            write_row = data_start_row + idx
             row_ctx = extract_row_semantic_context(source_row, product_header.by_col)
-
-            generated: dict[str, object] = {}
-            if use_model_synthesis:
-                try:
-                    generated = ai_synthesize_row_values(
-                        semantic_context=row_ctx,
-                        provider=effective_ai_provider,
-                        model=effective_ai_model,
-                        api_key_override=ai_api_key,
-                        base_url_override=ai_base_url,
-                        model_full=selected_model_full,
-                    )
-                except HTTPException:
-                    generated = {}
 
             title_fallback = row_ctx.get("title", "")
             selling_fallback = row_ctx.get("selling_points", "")
@@ -2095,14 +3449,30 @@ async def autofill(
             price_fallback = row_ctx.get("price", "")
             sku_fallback = row_ctx.get("sku", "")
 
+            generated_col_values = ai_synthesis_batch_values.get(idx, {}) if use_model_synthesis else {}
+
             keyfeatures_values: list[str] = []
-            keyfeatures_obj = generated.get("keyfeatures")
-            if isinstance(keyfeatures_obj, list):
-                keyfeatures_values = [str(x).strip() for x in keyfeatures_obj if str(x).strip()]
-            elif isinstance(keyfeatures_obj, str):
-                keyfeatures_values = split_keyfeatures(keyfeatures_obj)
-            if not keyfeatures_values:
-                keyfeatures_values = split_keyfeatures(selling_fallback or details_fallback)
+            model_feature_candidates: list[str] = []
+            for col_key, text in generated_col_values.items():
+                target_name = synthesis_targets.get(col_key, "")
+                if target_name.startswith("keyfeature") and text.strip():
+                    model_feature_candidates.extend(split_sentences(text.strip(), limit=3, max_chars_each=120))
+            model_feature_candidates = dedupe_preserve_order(model_feature_candidates)
+            if len(model_feature_candidates) >= 2:
+                keyfeatures_values = model_feature_candidates[:6]
+            else:
+                keyfeatures_values = split_sentences(selling_fallback or details_fallback, limit=6, max_chars_each=120)
+            keyfeatures_values = dedupe_preserve_order(keyfeatures_values)
+
+            generated_site_description = ""
+            for col_key, text in generated_col_values.items():
+                target_name = synthesis_targets.get(col_key, "")
+                if target_name in {"sitedescription", "shortdescription"} and text.strip():
+                    generated_site_description = text.strip()
+                    break
+            if not generated_site_description:
+                generated_site_description = details_fallback or selling_fallback
+            generated_site_description = make_short_description(generated_site_description, max_chars=300)
 
             keyfeature_idx = 0
             for tpl_col, target_key in synthesis_targets.items():
@@ -2114,45 +3484,66 @@ async def autofill(
                     continue
 
                 new_value: str | None = None
-                if target_key == "productname":
-                    obj = generated.get("productname")
-                    if isinstance(obj, str) and obj.strip():
-                        new_value = obj.strip()
-                    elif title_fallback:
-                        new_value = title_fallback[:200]
-                elif target_key == "shortdescription":
-                    obj = generated.get("shortdescription")
-                    if isinstance(obj, str) and obj.strip():
-                        new_value = obj.strip()[:300]
-                    elif details_fallback or selling_fallback:
-                        new_value = (details_fallback or selling_fallback)[:300]
-                elif target_key == "brand":
-                    obj = generated.get("brand")
-                    if isinstance(obj, str) and obj.strip():
-                        new_value = obj.strip()
-                    else:
-                        new_value = "Unbranded"
-                elif target_key == "price":
-                    obj = generated.get("price")
-                    if isinstance(obj, str) and obj.strip():
-                        new_value = obj.strip()
-                    elif price_fallback:
-                        new_value = price_fallback
-                elif target_key == "sku":
-                    obj = generated.get("sku")
-                    if isinstance(obj, str) and obj.strip():
-                        new_value = obj.strip()
-                    elif sku_fallback:
-                        new_value = sku_fallback
-                elif target_key.startswith("keyfeatures"):
+                model_value = generated_col_values.get(tpl_col)
+                is_keyfeature_col = target_key.startswith("keyfeature") or target_key == "features"
+                is_description_col = target_key in {"sitedescription", "shortdescription"}
+
+                if is_keyfeature_col:
                     if keyfeature_idx < len(keyfeatures_values):
                         new_value = keyfeatures_values[keyfeature_idx]
                         keyfeature_idx += 1
+                elif is_description_col:
+                    if generated_site_description:
+                        new_value = generated_site_description
+                elif isinstance(model_value, str) and model_value.strip():
+                    new_value = model_value.strip()
+                elif target_key == "productname":
+                    if title_fallback:
+                        new_value = title_fallback[:200]
+                elif target_key == "shortdescription":
+                    if details_fallback or selling_fallback:
+                        new_value = (details_fallback or selling_fallback)[:300]
+                elif target_key == "brand":
+                    new_value = "Unbranded"
+                elif target_key == "price":
+                    if price_fallback:
+                        new_value = price_fallback
+                elif target_key == "sku":
+                    if sku_fallback:
+                        new_value = sku_fallback
+
+                if (new_value is None or not new_value.strip()):
+                    default_value = default_value_for_required_field(target_key)
+                    if default_value:
+                        new_value = default_value
 
                 if new_value and new_value.strip():
-                    cell.value = new_value
-                    ai_synthesized_cells += 1
-                    synthesized_cols.add(tpl_col)
+                    written, reason = write_cell_with_constraints(
+                        workbook=template_wb,
+                        sheet=template_sheet,
+                        row=write_row,
+                        col=tpl_col,
+                        value=new_value,
+                        header_name=template_header.by_col.get(tpl_col, ""),
+                        header_row_index=template_header.row_index,
+                        requirement_hints=requirement_hints,
+                        dropdown_cache=dropdown_cache,
+                        spec_product_type_col=spec_product_type_col,
+                        hidden_valid_catalog=hidden_valid_catalog,
+                    )
+                    if written:
+                        ai_synthesized_cells += 1
+                        synthesized_cols.add(tpl_col)
+                    else:
+                        ai_synth_skipped_cells += 1
+                        if reason in {"dropdown-no-match", "constraint-empty"}:
+                            constraint_skipped_total += 1
+
+    if ai_synthesis_warning and not ai_warning:
+        ai_warning = f"AI synthesis degraded: {ai_synthesis_warning[:220]}"
+
+    if ai_warning.startswith("AI mapping output was unstable") and ai_synthesized_cells >= 10:
+        ai_warning = ""
 
     if use_ai and ai_added_columns == 0 and ai_synthesized_cells == 0 and not ai_warning:
         ai_warning = (
@@ -2173,12 +3564,19 @@ async def autofill(
             detail="No columns could be mapped between template and product sheet",
         )
 
-    filled_count, skipped_mapped_writes, skipped_mapped_cols = fill_template(
+    filled_count, skipped_mapped_writes, skipped_mapped_cols, mapped_constraint_skipped = fill_template(
+        template_wb,
         template_sheet,
         template_header,
         source_rows,
         mapping,
+        requirement_hints,
+        dropdown_cache,
+        data_start_row,
+        spec_product_type_col,
+        hidden_valid_catalog,
     )
+    constraint_skipped_total += mapped_constraint_skipped
     final_unmapped = [
         name
         for col, name in template_header.by_col.items()
@@ -2213,8 +3611,10 @@ async def autofill(
         "X-AI-Sample-Rows": str(min(len(source_rows), AI_SAMPLE_ROWS)),
         "X-AI-Synthesis-Mode": ai_synthesis_mode,
         "X-Rules-Source": rules_source,
+        "X-Data-Start-Row": str(data_start_row),
         "X-Filled-Rows": str(filled_count),
         "X-Skipped-Mapped-Writes": str(skipped_mapped_writes),
+        "X-Constraint-Skipped-Writes": str(constraint_skipped_total),
         "X-Skipped-Mapped-Columns": (
             to_latin1_header_value(" | ".join(skipped_mapped_column_names[:20]))
             if skipped_mapped_column_names
