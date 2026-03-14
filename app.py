@@ -8,13 +8,14 @@ import shutil
 import subprocess
 import urllib.error
 import urllib.request
+from copy import copy
 from collections import defaultdict
 from pathlib import Path
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from dataclasses import dataclass
 from difflib import SequenceMatcher, get_close_matches
-from typing import Annotated, cast
+from typing import Annotated, Callable, cast
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -906,6 +907,591 @@ def make_short_description(text: str, max_chars: int = 300) -> str:
     return merged[:max_chars].strip()
 
 
+def parse_decimal_value(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    matched = re.search(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
+    if not matched:
+        return None
+    try:
+        return Decimal(matched.group(0))
+    except Exception:
+        return None
+
+
+def extract_http_urls(text: str) -> list[str]:
+    if not text:
+        return []
+    urls = re.findall(r"https?://[^\s,;|]+", text)
+    return dedupe_preserve_order(urls)
+
+
+def sanitize_feature_text(text: str) -> str:
+    cleaned = text.strip()
+    if not cleaned:
+        return ""
+    lowered = normalize_header(cleaned)
+    if any(tok in lowered for tok in ["brand", "品牌", "warranty", "保修", "guarantee", "官方店", "official team"]):
+        return ""
+    return cleaned
+
+
+def is_image_like_url(url: str) -> bool:
+    text = url.strip().lower()
+    if not (text.startswith("http://") or text.startswith("https://")):
+        return False
+    if any(host in text for host in ["postimg", "imgur", "images", "image", "cdn"]):
+        return True
+    return any(ext in text for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"])
+
+
+def extract_row_urls(source_row: dict[int, CellValue], source_headers: dict[int, str]) -> list[str]:
+    urls: list[str] = []
+    for col, val in source_row.items():
+        if val in (None, ""):
+            continue
+        header_key = normalize_header(source_headers.get(col, "")).replace(" ", "")
+        if not any(token in header_key for token in ["image", "img", "picture", "photo", "url"]):
+            continue
+        text = str(val).strip()
+        if not text:
+            continue
+        for url in extract_http_urls(text):
+            if is_image_like_url(url):
+                urls.append(url)
+    return dedupe_preserve_order(urls)
+
+
+def infer_outdoor_activity(text_blob: str) -> str:
+    key = normalize_header(text_blob).replace(" ", "")
+    if not key:
+        return ""
+    rules: list[tuple[list[str], str]] = [
+        (["camp", "camping", "tent", "露营", "帐篷"], "Camping"),
+        (["hike", "hiking", "trail", "徒步"], "Hiking"),
+        (["backpack", "backpacking", "背包"], "Backpacking"),
+        (["fish", "fishing", "钓"], "Fishing"),
+        (["outdoor", "outdoors", "户外"], "Outdoor Recreation"),
+    ]
+    for tokens, label in rules:
+        if any(tok in key for tok in tokens):
+            return label
+    return ""
+
+
+def suggest_product_line(text_blob: str) -> str:
+    parts = [p for p in re.split(r"[\s,;|/\\]+", text_blob) if p.strip()]
+    keywords: list[str] = []
+    for raw in parts:
+        token = raw.strip()
+        if len(token) < 3:
+            continue
+        if re.fullmatch(r"\d+(?:\.\d+)?", token):
+            continue
+        if token.lower() in {"the", "and", "with", "for"}:
+            continue
+        if token not in keywords:
+            keywords.append(token)
+        if len(keywords) >= 3:
+            break
+    return " ".join(keywords[:3])
+
+
+def suggest_msrp(price_text: str) -> str:
+    price = parse_decimal_value(price_text)
+    if price is None or price <= 0:
+        return ""
+
+    floor_target = (price * Decimal("1.10")).quantize(Decimal("0.01"))
+    integer_part = int(floor_target.to_integral_value(rounding="ROUND_CEILING"))
+    if integer_part <= int(price):
+        integer_part = int(price) + 1
+
+    while not any(ch in str(integer_part) for ch in ["5", "6", "9"]):
+        integer_part += 1
+
+    msrp = Decimal(integer_part) - Decimal("0.01")
+    if msrp <= floor_target:
+        msrp = Decimal(integer_part + 1) - Decimal("0.01")
+    return f"{msrp:.2f}"
+
+
+def find_template_cols_by_tokens(template_headers: dict[int, str], *tokens: str) -> list[int]:
+    norm_tokens = [t.strip().lower() for t in tokens if t.strip()]
+    cols: list[int] = []
+    for col, name in sorted(template_headers.items(), key=lambda x: x[0]):
+        compact = normalize_header(name).replace(" ", "")
+        if any(tok in compact for tok in norm_tokens):
+            cols.append(col)
+    return cols
+
+
+def set_template_header_cell(template_sheet: Worksheet, template_header_row: int, col: int, header_name: str) -> None:
+    candidate_rows = [
+        template_header_row,
+        max(1, template_header_row - 1),
+        max(1, template_header_row - 2),
+        template_header_row + 1,
+        template_header_row + 2,
+    ]
+    for rr in candidate_rows:
+        header_cell = resolve_writable_cell(template_sheet, rr, col)
+        if isinstance(header_cell, Cell):
+            header_cell.value = header_name
+            return
+        fallback_cell = template_sheet.cell(row=rr, column=col)
+        if isinstance(fallback_cell, Cell):
+            fallback_cell.value = header_name
+            return
+
+
+def insert_template_column_after(
+    template_sheet: Worksheet,
+    template_header: HeaderInfo,
+    after_col: int,
+    header_name: str,
+) -> int:
+    insert_at = max(1, after_col + 1)
+    template_sheet.insert_cols(insert_at, 1)
+
+    max_row = template_sheet.max_row
+    for row in range(1, max_row + 1):
+        raw_src = template_sheet.cell(row=row, column=after_col)
+        src = resolve_writable_cell(template_sheet, row, after_col)
+        dst = resolve_writable_cell(template_sheet, row, insert_at)
+        if not isinstance(dst, Cell):
+            continue
+
+        dst.value = raw_src.value
+        if isinstance(src, Cell):
+            dst._style = copy(src._style)
+            if src.comment is not None:
+                dst.comment = copy(src.comment)
+            if src.hyperlink is not None:
+                dst.hyperlink = copy(src.hyperlink)
+
+    src_letter = get_column_letter(after_col)
+    dst_letter = get_column_letter(insert_at)
+    if src_letter in template_sheet.column_dimensions:
+        template_sheet.column_dimensions[dst_letter] = copy(template_sheet.column_dimensions[src_letter])
+
+    shifted: dict[int, str] = {}
+    for col, name in sorted(template_header.by_col.items(), key=lambda x: x[0]):
+        shifted[col + 1 if col >= insert_at else col] = name
+    template_header.by_col = shifted
+
+    set_template_header_cell(template_sheet, template_header.row_index, insert_at, header_name)
+    template_header.by_col[insert_at] = header_name
+    return insert_at
+
+
+def find_family_columns_in_header_area(
+    template_sheet: Worksheet,
+    *,
+    tokens: list[str],
+    scan_rows: int = 12,
+) -> list[tuple[int, str]]:
+    token_keys = [t.strip().lower() for t in tokens if t.strip()]
+    found: dict[int, str] = {}
+    last_row = min(template_sheet.max_row, max(1, scan_rows))
+    for row in range(1, last_row + 1):
+        for col in range(1, template_sheet.max_column + 1):
+            raw = template_sheet.cell(row=row, column=col).value
+            if raw in (None, ""):
+                continue
+            text = str(raw).strip()
+            if not text:
+                continue
+            compact = normalize_header(text).replace(" ", "")
+            if any(tok in compact for tok in token_keys):
+                found[col] = text
+    return sorted(found.items(), key=lambda x: x[0])
+
+
+def ensure_plus_family_columns(
+    template_sheet: Worksheet,
+    template_header: HeaderInfo,
+    *,
+    family_tokens: list[str],
+    required_count: int,
+    header_name_builder: Callable[[int], str],
+    anchor_tokens: list[str] | None = None,
+) -> list[int]:
+    def infer_next_seq(current_cols: list[int]) -> int:
+        max_seq = 0
+        for col in current_cols:
+            name = str(template_header.by_col.get(col, "") or "")
+            m = re.search(r"(\d+)\s*\(\+\)", name)
+            if m:
+                max_seq = max(max_seq, int(m.group(1)))
+        return max_seq + 1 if max_seq > 0 else len(current_cols) + 1
+
+    cols = find_template_cols_by_tokens(template_header.by_col, *family_tokens)
+
+    if not cols:
+        fallback_hits = find_family_columns_in_header_area(
+            template_sheet,
+            tokens=family_tokens,
+            scan_rows=max(12, template_header.row_index + 3),
+        )
+        for col, header_text in fallback_hits:
+            if col not in template_header.by_col:
+                template_header.by_col[col] = header_text
+        cols = find_template_cols_by_tokens(template_header.by_col, *family_tokens)
+
+    if len(cols) >= required_count:
+        return cols
+
+    anchor_cols: list[int] = []
+    if anchor_tokens:
+        anchor_cols = find_template_cols_by_tokens(template_header.by_col, *anchor_tokens)
+
+    while len(cols) < required_count:
+        seq = infer_next_seq(cols)
+        if cols:
+            anchor = cols[-1]
+        elif anchor_cols:
+            anchor = anchor_cols[-1]
+        else:
+            anchor = template_sheet.max_column
+
+        existing_names = {
+            normalize_header(v)
+            for v in template_header.by_col.values()
+            if str(v).strip()
+        }
+        new_name = header_name_builder(seq)
+        while normalize_header(new_name) in existing_names:
+            seq += 1
+            new_name = header_name_builder(seq)
+
+        new_col = insert_template_column_after(
+            template_sheet,
+            template_header,
+            anchor,
+            new_name,
+        )
+        cols.append(new_col)
+
+    return cols
+
+
+def ensure_template_column(template_sheet: Worksheet, template_header: HeaderInfo, header_name: str) -> int:
+    wanted = normalize_header(header_name)
+    for col, name in template_header.by_col.items():
+        if normalize_header(name) == wanted:
+            return col
+
+    new_col = template_sheet.max_column + 1
+    set_template_header_cell(template_sheet, template_header.row_index, new_col, header_name)
+    template_header.by_col[new_col] = header_name
+    return new_col
+
+
+def apply_walmart_field_rules(
+    *,
+    workbook: Workbook,
+    template_sheet: Worksheet,
+    template_header: HeaderInfo,
+    product_header: HeaderInfo,
+    source_rows: list[dict[int, CellValue]],
+    data_start_row: int,
+    requirement_hints: dict[int, str],
+    dropdown_cache: dict[tuple[int, int], list[str]],
+    spec_product_type_col: int | None,
+    hidden_valid_catalog: dict[str, list[str]],
+) -> tuple[set[int], int]:
+    touched_cols: set[int] = set()
+    touched_cells = 0
+
+    keyfeature_cols = ensure_plus_family_columns(
+        template_sheet,
+        template_header,
+        family_tokens=["keyfeatures", "keyfeature"],
+        required_count=4,
+        header_name_builder=lambda i: f"Key Features {i} (+)",
+    )
+
+    key_feature_3_col = keyfeature_cols[2]
+    key_feature_4_col = keyfeature_cols[3]
+    template_header.by_col[key_feature_3_col] = "Key Features 3 (+)"
+    template_header.by_col[key_feature_4_col] = "Key Features 4 (+)"
+    set_template_header_cell(template_sheet, template_header.row_index, key_feature_3_col, "Key Features 3 (+)")
+    set_template_header_cell(template_sheet, template_header.row_index, key_feature_4_col, "Key Features 4 (+)")
+
+    main_image_cols = find_template_cols_by_tokens(template_header.by_col, "mainimageurl")
+
+    max_additional_needed = 0
+    row_urls_cache: list[list[str]] = []
+    for row in source_rows:
+        urls = extract_row_urls(row, product_header.by_col)
+        row_urls_cache.append(urls)
+        max_additional_needed = max(max_additional_needed, max(0, len(urls) - 1))
+
+    additional_image_cols = ensure_plus_family_columns(
+        template_sheet,
+        template_header,
+        family_tokens=["additionalimageurl", "productsecondaryimageurl"],
+        required_count=max_additional_needed,
+        header_name_builder=lambda i: f"Additional Image URL {i} (+)",
+        anchor_tokens=["mainimageurl"],
+    )
+
+    product_id_type_cols = find_template_cols_by_tokens(template_header.by_col, "productidtype", "externalproductidtype")
+    product_id_cols = find_template_cols_by_tokens(template_header.by_col, "productid", "externalproductid")
+    product_id_cols = [
+        col
+        for col in product_id_cols
+        if col not in product_id_type_cols
+        and "productidtype" not in normalize_header(template_header.by_col.get(col, "")).replace(" ", "")
+    ]
+    fulfillment_cols = find_template_cols_by_tokens(template_header.by_col, "fulfillmentcenterid")
+    site_desc_cols = find_template_cols_by_tokens(template_header.by_col, "sitedescription")
+    activity_cols = find_template_cols_by_tokens(template_header.by_col, "activity")
+    additional_feature_cols = find_template_cols_by_tokens(template_header.by_col, "additionalfeatures")
+    product_line_cols = find_template_cols_by_tokens(template_header.by_col, "productline")
+    sports_league_cols = find_template_cols_by_tokens(template_header.by_col, "sportsleague")
+    sports_team_cols = find_template_cols_by_tokens(template_header.by_col, "sportsteam")
+    total_count_cols = find_template_cols_by_tokens(template_header.by_col, "totalcount")
+    warranty_url_cols = find_template_cols_by_tokens(template_header.by_col, "warrantyurl")
+    variant_group_cols = find_template_cols_by_tokens(template_header.by_col, "variantgroupid")
+    model_number_cols = find_template_cols_by_tokens(template_header.by_col, "modelnumber")
+    mfr_part_cols = find_template_cols_by_tokens(template_header.by_col, "manufacturerpartnumber")
+    variant_name_cols = find_template_cols_by_tokens(template_header.by_col, "variantattributenames")
+    is_primary_variant_cols = find_template_cols_by_tokens(template_header.by_col, "isprimaryvariant")
+    swatch_variant_attr_cols = find_template_cols_by_tokens(template_header.by_col, "swatchvariantattribute")
+    product_id_update_cols = find_template_cols_by_tokens(template_header.by_col, "productidupdate")
+    msrp_cols = find_template_cols_by_tokens(template_header.by_col, "msrp")
+
+    variant_candidates: list[str] = []
+    for _c, name in product_header.by_col.items():
+        key = normalize_header(name).replace(" ", "")
+        if "color" in key or "颜色" in key:
+            variant_candidates.append("Color")
+        elif "size" in key or "尺寸" in key or "尺码" in key:
+            variant_candidates.append("Size")
+        elif "pattern" in key:
+            variant_candidates.append("Pattern")
+    variant_candidates = dedupe_preserve_order(variant_candidates)
+    variant_attr_name = ""
+    if len(source_rows) > 1 and variant_candidates:
+        variant_attr_name = ",".join(variant_candidates[:2])
+    elif len(source_rows) > 1:
+        variant_attr_name = "Model Number"
+
+    def write_direct_value(row: int, col: int, value: str, overwrite: bool = True) -> None:
+        nonlocal touched_cells
+        cell = resolve_writable_cell(template_sheet, row, col)
+        if cell is None:
+            return
+        if not overwrite and cell.value not in (None, ""):
+            return
+        cell.value = value
+        touched_cells += 1
+        touched_cols.add(col)
+
+    def write_constrained_value(row: int, col: int, value: str, overwrite: bool = True) -> None:
+        nonlocal touched_cells
+        cell = resolve_writable_cell(template_sheet, row, col)
+        if cell is None:
+            return
+        if not overwrite and cell.value not in (None, ""):
+            return
+        written, _reason = write_cell_with_constraints(
+            workbook=workbook,
+            sheet=template_sheet,
+            row=row,
+            col=col,
+            value=value,
+            header_name=template_header.by_col.get(col, ""),
+            header_row_index=template_header.row_index,
+            requirement_hints=requirement_hints,
+            dropdown_cache=dropdown_cache,
+            spec_product_type_col=spec_product_type_col,
+            hidden_valid_catalog=hidden_valid_catalog,
+        )
+        if written:
+            touched_cells += 1
+            touched_cols.add(col)
+
+    def write_dropdown_preferred(row: int, col: int, preferred_values: list[str], fallback_direct: str = "") -> None:
+        key = (row, col)
+        options = dropdown_cache.get(key)
+        if options is None:
+            options = extract_dropdown_options_for_cell(
+                workbook,
+                template_sheet,
+                row,
+                col,
+                template_header.by_col.get(col, ""),
+                spec_product_type_col,
+                hidden_valid_catalog,
+            )
+            dropdown_cache[key] = options
+
+        chosen: str | None = None
+        if options:
+            for pref in preferred_values:
+                chosen = pick_best_dropdown_option(pref, options)
+                if chosen:
+                    break
+            if not chosen:
+                chosen = options[0]
+
+        if chosen:
+            write_direct_value(row, col, chosen, overwrite=True)
+            return
+
+        if fallback_direct:
+            write_direct_value(row, col, fallback_direct, overwrite=True)
+
+    for idx, source_row in enumerate(source_rows):
+        write_row = data_start_row + idx
+        row_ctx = extract_row_semantic_context(source_row, product_header.by_col)
+        row_urls = row_urls_cache[idx] if idx < len(row_urls_cache) else []
+
+        row_text_values = [str(v).strip() for v in source_row.values() if v not in (None, "")]
+        text_blob = " ".join(row_text_values)
+
+        features: list[str] = []
+        for text in row_text_values:
+            for item in split_sentences(text, limit=4, max_chars_each=140):
+                cleaned = sanitize_feature_text(item)
+                if cleaned:
+                    features.append(cleaned)
+        features = dedupe_preserve_order(features)
+
+        if len(features) < 2:
+            backup = split_sentences(row_ctx.get("selling_points", "") or row_ctx.get("details", ""), limit=4, max_chars_each=140)
+            for item in backup:
+                cleaned = sanitize_feature_text(item)
+                if cleaned:
+                    features.append(cleaned)
+        features = dedupe_preserve_order(features)
+
+        site_description_raw = row_ctx.get("details", "") or row_ctx.get("selling_points", "") or row_ctx.get("title", "")
+        site_description = make_short_description(sanitize_feature_text(site_description_raw) or site_description_raw, max_chars=300)
+
+        product_id_value = ""
+        id_priority_groups = [["upc"], ["gtin", "barcode"], ["productid", "externalproductid"]]
+        for token_group in id_priority_groups:
+            if product_id_value:
+                break
+            for src_col, src_name in product_header.by_col.items():
+                src_key = normalize_header(src_name).replace(" ", "")
+                value = source_row.get(src_col)
+                if value in (None, ""):
+                    continue
+                if any(tok in src_key for tok in token_group):
+                    product_id_value = str(value).strip()
+                    break
+
+        sku_value = (row_ctx.get("sku", "") or "").strip()
+        price_value = (row_ctx.get("price", "") or "").strip()
+
+        total_count_value = ""
+        for src_col, src_name in product_header.by_col.items():
+            src_key = normalize_header(src_name).replace(" ", "")
+            if any(tok in src_key for tok in ["totalcount", "count", "quantity", "pack"]):
+                v = source_row.get(src_col)
+                if v not in (None, ""):
+                    total_count_value = str(v).strip()
+                    break
+
+        if key_feature_3_col:
+            feature3 = features[2] if len(features) >= 3 else (features[0] if features else "")
+            if feature3:
+                write_direct_value(write_row, key_feature_3_col, feature3, overwrite=True)
+        if key_feature_4_col:
+            feature4 = features[3] if len(features) >= 4 else (features[1] if len(features) >= 2 else (features[0] if features else ""))
+            if feature4:
+                write_direct_value(write_row, key_feature_4_col, feature4, overwrite=True)
+
+        for feature_idx, col in enumerate(keyfeature_cols):
+            if feature_idx < len(features):
+                write_direct_value(write_row, col, features[feature_idx], overwrite=True)
+
+        for col in site_desc_cols:
+            if site_description:
+                write_direct_value(write_row, col, site_description, overwrite=True)
+
+        for col in product_id_type_cols:
+            write_direct_value(write_row, col, "UPC", overwrite=True)
+        for col in product_id_cols:
+            if product_id_value:
+                write_direct_value(write_row, col, product_id_value, overwrite=True)
+
+        for col in fulfillment_cols:
+            write_dropdown_preferred(write_row, col, ["Default", "Main", "FC", "Warehouse"], fallback_direct="Default")
+
+        if row_urls:
+            if main_image_cols:
+                write_direct_value(write_row, main_image_cols[0], row_urls[0], overwrite=True)
+            for img_idx, col in enumerate(additional_image_cols):
+                source_idx = img_idx + 1
+                if source_idx >= len(row_urls):
+                    break
+                write_direct_value(write_row, col, row_urls[source_idx], overwrite=True)
+        elif main_image_cols:
+            write_direct_value(write_row, main_image_cols[0], "", overwrite=True)
+
+        activity_value = infer_outdoor_activity(text_blob)
+        if activity_value:
+            for col in activity_cols:
+                write_direct_value(write_row, col, activity_value, overwrite=False)
+            for col in additional_feature_cols:
+                write_direct_value(write_row, col, activity_value, overwrite=False)
+
+        line_value = suggest_product_line(row_ctx.get("title", "") or text_blob)
+        if line_value:
+            for col in product_line_cols:
+                write_direct_value(write_row, col, line_value, overwrite=False)
+
+        for col in sports_league_cols:
+            write_direct_value(write_row, col, "NFL", overwrite=True)
+        for col in sports_team_cols:
+            write_direct_value(write_row, col, "No Official Team", overwrite=True)
+        for col in warranty_url_cols:
+            write_direct_value(write_row, col, "https://i.postimg.cc/nc7q1Wsw/Store-return-policy.png", overwrite=True)
+
+        if total_count_value:
+            for col in total_count_cols:
+                write_direct_value(write_row, col, total_count_value, overwrite=False)
+
+        if sku_value:
+            for col in variant_group_cols:
+                write_direct_value(write_row, col, sku_value, overwrite=True)
+            for col in model_number_cols:
+                write_direct_value(write_row, col, sku_value, overwrite=True)
+            for col in mfr_part_cols:
+                write_direct_value(write_row, col, sku_value, overwrite=True)
+
+        if variant_attr_name:
+            for col in variant_name_cols:
+                write_direct_value(write_row, col, variant_attr_name, overwrite=True)
+            if sku_value:
+                for col in swatch_variant_attr_cols:
+                    write_direct_value(write_row, col, sku_value, overwrite=True)
+
+        for col in product_id_update_cols:
+            write_dropdown_preferred(write_row, col, ["No", "False"], fallback_direct="No")
+
+        if is_primary_variant_cols and len(source_rows) > 1:
+            primary_flag = "Yes" if idx == 0 else "No"
+            for col in is_primary_variant_cols:
+                write_dropdown_preferred(write_row, col, [primary_flag], fallback_direct=primary_flag)
+
+        msrp_value = suggest_msrp(price_value)
+        if msrp_value:
+            for col in msrp_cols:
+                write_direct_value(write_row, col, msrp_value, overwrite=True)
+
+    return touched_cols, touched_cells
+
+
 def default_value_for_required_field(header_key: str) -> str | None:
     key = header_key.lower().replace(" ", "")
     if "condition" in key:
@@ -949,6 +1535,13 @@ def choose_dropdown_default_for_header(
 
     if key in {"skuupdate", "productidupdate", "isprimaryvariant"}:
         return pick(["No", "Yes"])
+    if "fulfillmentcenterid" in key:
+        chosen = pick(["default", "main", "fc", "warehouse"])
+        if chosen:
+            return chosen
+        return options[0]
+    if "productidtype" in key:
+        return pick(["UPC", "GTIN-12", "GTIN12"])
     if key == "variantattributenames":
         return pick(["color", "size", "pattern", "theme", "countPerPack", "count", "multipackQuantity"])
     if "condition" in key:
@@ -3551,13 +4144,6 @@ async def autofill(
             "Current result is mostly deterministic mapping; provide richer product fields or API-key-backed generation."
         )
 
-    required_unfilled: list[str] = []
-    for tpl_col, tpl_name in template_header.by_col.items():
-        tpl_key = normalize_header(tpl_name)
-        policy = rule_policies.get(tpl_key)
-        if policy and policy.get("required", False) and tpl_col not in mapping and tpl_col not in synthesized_cols:
-            required_unfilled.append(tpl_name)
-
     if not mapping:
         raise HTTPException(
             status_code=400,
@@ -3577,6 +4163,30 @@ async def autofill(
         hidden_valid_catalog,
     )
     constraint_skipped_total += mapped_constraint_skipped
+
+    manual_rule_cols, manual_rule_cells = apply_walmart_field_rules(
+        workbook=template_wb,
+        template_sheet=template_sheet,
+        template_header=template_header,
+        product_header=product_header,
+        source_rows=source_rows,
+        data_start_row=data_start_row,
+        requirement_hints=requirement_hints,
+        dropdown_cache=dropdown_cache,
+        spec_product_type_col=spec_product_type_col,
+        hidden_valid_catalog=hidden_valid_catalog,
+    )
+
+    synthesized_cols.update(manual_rule_cols)
+    ai_synthesized_cells += manual_rule_cells
+
+    required_unfilled: list[str] = []
+    for tpl_col, tpl_name in template_header.by_col.items():
+        tpl_key = normalize_header(tpl_name)
+        policy = rule_policies.get(tpl_key)
+        if policy and policy.get("required", False) and tpl_col not in mapping and tpl_col not in synthesized_cols:
+            required_unfilled.append(tpl_name)
+
     final_unmapped = [
         name
         for col, name in template_header.by_col.items()
